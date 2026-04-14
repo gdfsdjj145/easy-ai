@@ -36,5 +36,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVCM0ZEMURGMUI0NUE1MDQKUldRRXBVVWIzOUUvVzB4cmVJT3ZCKy9VazVMR1dHbXlYTm9HZE1HVEg1V284M1Jjdk9RVGVpd0sK",
+      "endpoints": [
+        "https://github.com/gdfsdjj145/easy-ai/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
