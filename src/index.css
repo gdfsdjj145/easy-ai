@@ -1,0 +1,77 @@
+@import "@fontsource-variable/space-grotesk";
+@import "@fontsource/fraunces";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color: #202020;
+  background:
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.88), transparent 30%),
+    linear-gradient(180deg, #f3f1ed 0%, #ece9e3 100%);
+  font-family: "Space Grotesk Variable", "Avenir Next", sans-serif;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background-image:
+    radial-gradient(circle at 50% -10%, rgba(255, 255, 255, 0.95), transparent 32%),
+    linear-gradient(180deg, #f1efec 0%, #ebe8e2 100%);
+  color: #202020;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  overscroll-behavior: none;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+body {
+  overflow: hidden;
+}
+
+[class*="overflow-auto"],
+[class*="overflow-y-auto"],
+[class*="overflow-x-auto"] {
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: auto;
+}
+
+::selection {
+  background: rgba(255, 211, 41, 0.35);
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+#root > div {
+  animation: page-enter 420ms ease-out;
+}
+
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
