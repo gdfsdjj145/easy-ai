@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { FileEntry, FileRecord, FsAdapter, SearchResult, WorkspaceSelection } from "../../types";
-import { createId, fileExtension } from "../utils";
+import { createId, fileExtension, isBinaryPreviewExtension } from "../utils";
 
 interface TauriWorkspaceEntry {
   path: string;
@@ -13,6 +13,11 @@ interface TauriSearchResult {
   path: string;
   name: string;
   snippet: string;
+}
+
+interface TauriBinaryPayload {
+  dataUrl: string;
+  mimeType: string;
 }
 
 function ensureTauri() {
@@ -76,6 +81,24 @@ export class TauriFsAdapter implements FsAdapter {
 
   async readFile(path: string) {
     const workspacePath = this.requireRootPath();
+    const extension = fileExtension(path);
+
+    if (isBinaryPreviewExtension(extension)) {
+      const payload = await invoke<TauriBinaryPayload>("read_workspace_binary", {
+        workspacePath,
+        relativePath: path,
+      });
+
+      return {
+        path,
+        name: path.split("/").pop() ?? path,
+        content: "",
+        extension,
+        previewUrl: payload.dataUrl,
+        mimeType: payload.mimeType,
+      } satisfies FileRecord;
+    }
+
     const content = await invoke<string>("read_workspace_file", {
       workspacePath,
       relativePath: path,
@@ -85,7 +108,7 @@ export class TauriFsAdapter implements FsAdapter {
       path,
       name: path.split("/").pop() ?? path,
       content,
-      extension: fileExtension(path),
+      extension,
     } satisfies FileRecord;
   }
 

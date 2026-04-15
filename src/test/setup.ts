@@ -1,4 +1,5 @@
 import "@testing-library/jest-dom/vitest";
+import { vi } from "vitest";
 
 class ResizeObserver {
   observe() {}
@@ -23,6 +24,16 @@ if (!("scrollIntoView" in HTMLElement.prototype)) {
     value: () => {},
   });
 }
+
+vi.mock("react-pdf", () => ({
+  pdfjs: {
+    GlobalWorkerOptions: {
+      workerSrc: "",
+    },
+  },
+  Document: ({ children }: { children?: unknown }) => children,
+  Page: ({ pageNumber }: { pageNumber?: number }) => `PDF page ${pageNumber ?? 1}`,
+}));
 
 const defaultRect = new DOMRect(0, 0, 12, 18);
 

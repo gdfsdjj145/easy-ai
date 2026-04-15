@@ -27,6 +27,43 @@ describe("App", () => {
     expect(screen.getByPlaceholderText("输入提示信息以处理当前文档……")).toBeInTheDocument();
   });
 
+  it("renders image files in the preview panel", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 1440,
+    });
+    window.dispatchEvent(new Event("resize"));
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findAllByText("Mock Workspace");
+    await user.click((await screen.findAllByText("cover.svg"))[0].closest("button")!);
+
+    expect(await screen.findByRole("img", { name: "cover.svg" })).toBeInTheDocument();
+    expect(screen.getByText("图片预览")).toBeInTheDocument();
+  });
+
+  it("renders spreadsheet files in the preview panel", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 1440,
+    });
+    window.dispatchEvent(new Event("resize"));
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findAllByText("Mock Workspace");
+    await user.click((await screen.findAllByText("metrics.csv"))[0].closest("button")!);
+
+    expect(await screen.findByText("Ada")).toBeInTheDocument();
+    expect(screen.getAllByText("表格预览").length).toBeGreaterThan(0);
+    expect(screen.getByText("Score")).toBeInTheDocument();
+  });
+
   it("opens the settings view for agent configuration", async () => {
     Object.defineProperty(window, "innerWidth", {
       writable: true,

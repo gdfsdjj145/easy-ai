@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -33,6 +34,13 @@ struct SearchResult {
   path: String,
   name: String,
   snippet: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceBinaryPayload {
+  data_url: String,
+  mime_type: String,
 }
 
 #[derive(Serialize)]
@@ -116,6 +124,22 @@ fn list_workspace(workspace_path: String) -> Result<Vec<WorkspaceEntry>, String>
 fn read_workspace_file(workspace_path: String, relative_path: String) -> Result<String, String> {
   let path = resolve_relative_path(&workspace_path, &relative_path)?;
   fs::read_to_string(path).map_err(|error| format!("读取文件失败：{error}"))
+}
+
+#[tauri::command]
+fn read_workspace_binary(
+  workspace_path: String,
+  relative_path: String,
+) -> Result<WorkspaceBinaryPayload, String> {
+  let path = resolve_relative_path(&workspace_path, &relative_path)?;
+  let bytes = fs::read(path).map_err(|error| format!("读取二进制文件失败：{error}"))?;
+  let mime_type = mime_type_from_path(&relative_path);
+  let encoded = BASE64.encode(bytes);
+
+  Ok(WorkspaceBinaryPayload {
+    data_url: format!("data:{mime_type};base64,{encoded}"),
+    mime_type: mime_type.to_string(),
+  })
 }
 
 #[tauri::command]
@@ -402,6 +426,28 @@ fn resolve_relative_path(workspace_path: &str, relative_path: &str) -> Result<Pa
   }
 
   Ok(root.join(relative))
+}
+
+fn mime_type_from_path(path: &str) -> &'static str {
+  match Path::new(path)
+    .extension()
+    .and_then(|value| value.to_str())
+    .map(|value| value.to_ascii_lowercase())
+    .as_deref()
+  {
+    Some("apng") => "image/apng",
+    Some("csv") => "text/csv",
+    Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    Some("gif") => "image/gif",
+    Some("jpeg") | Some("jpg") => "image/jpeg",
+    Some("pdf") => "application/pdf",
+    Some("png") => "image/png",
+    Some("svg") => "image/svg+xml",
+    Some("webp") => "image/webp",
+    Some("xls") => "application/vnd.ms-excel",
+    Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    _ => "application/octet-stream",
+  }
 }
 
 fn visit_directory(root: &Path, current: &Path, items: &mut Vec<WorkspaceEntry>) -> Result<(), String> {
@@ -1156,6 +1202,7 @@ pub fn run() {
       validate_workspace,
       list_workspace,
       read_workspace_file,
+      read_workspace_binary,
       write_workspace_file,
       create_workspace_directory,
       rename_workspace_path,

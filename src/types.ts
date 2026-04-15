@@ -38,6 +38,8 @@ export interface FileRecord {
   name: string;
   content: string;
   extension: string;
+  previewUrl?: string;
+  mimeType?: string;
 }
 
 export interface FileAction {

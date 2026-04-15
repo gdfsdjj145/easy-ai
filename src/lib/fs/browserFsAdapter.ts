@@ -1,6 +1,6 @@
 import { clearWorkspaceHandle, loadWorkspaceHandle, persistWorkspaceHandle } from "../persistence";
 import type { FileEntry, FileRecord, FsAdapter, SearchResult, WorkspaceSelection } from "../../types";
-import { createId, fileExtension } from "../utils";
+import { createId, fileExtension, isBinaryPreviewExtension } from "../utils";
 
 interface TreeNode {
   name: string;
@@ -84,6 +84,15 @@ async function removeEntry(
 
   const parent = await resolveDirectoryHandle(rootHandle, segments.join("/"));
   await parent.removeEntry(name, { recursive });
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file as data URL."));
+    reader.readAsDataURL(file);
+  });
 }
 
 async function copyPath(
@@ -193,11 +202,23 @@ export class BrowserFsAdapter implements FsAdapter {
       throw new Error(`File not found: ${path}`);
     }
 
+    const extension = fileExtension(entry.path);
+    if (isBinaryPreviewExtension(extension)) {
+      return {
+        path: entry.path,
+        name: entry.name,
+        content: "",
+        extension,
+        previewUrl: await readFileAsDataUrl(entry.file),
+        mimeType: entry.file.type || undefined,
+      } satisfies FileRecord;
+    }
+
     return {
       path: entry.path,
       name: entry.name,
       content: await entry.file.text(),
-      extension: fileExtension(entry.path),
+      extension,
     } satisfies FileRecord;
   }
 

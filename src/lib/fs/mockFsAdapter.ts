@@ -1,7 +1,16 @@
 import type { FileEntry, FileRecord, FsAdapter, SearchResult, WorkspaceSelection } from "../../types";
-import { createId, fileExtension } from "../utils";
+import { createId, fileExtension, isBinaryPreviewExtension, mimeTypeForExtension } from "../utils";
 
 type MockFiles = Record<string, string>;
+
+function toDataUrl(content: string, extension: string) {
+  const mimeType = mimeTypeForExtension(extension);
+  if (extension === "svg") {
+    return `data:${mimeType};utf8,${encodeURIComponent(content)}`;
+  }
+
+  return `data:${mimeType};base64,${btoa(content)}`;
+}
 
 export class MockFsAdapter implements FsAdapter {
   private directories = new Set<string>();
@@ -11,6 +20,9 @@ export class MockFsAdapter implements FsAdapter {
       "notes/brief.md": "# Brief\n\nShip the AI workstation MVP this week.",
       "notes/todo.txt": "Validate write confirmation flow.\nCheck session recovery.",
       "research/market.md": "Users want a local-first workspace with fewer abstractions.",
+      "gallery/cover.svg":
+        "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='220' viewBox='0 0 320 220'><rect width='320' height='220' rx='28' fill='#f6efe4'/><circle cx='92' cy='88' r='36' fill='#d6a42b'/><rect x='142' y='58' width='110' height='20' rx='10' fill='#2b2a28'/><rect x='142' y='92' width='86' height='14' rx='7' fill='#8f8a83'/><rect x='54' y='150' width='212' height='20' rx='10' fill='#d9d1c6'/></svg>",
+      "tables/metrics.csv": "Name,Score,Trend\nAda,98,Up\nGrace,97,Stable\nLinus,95,Up",
     },
   ) {
     this.rebuildDirectories();
@@ -82,11 +94,23 @@ export class MockFsAdapter implements FsAdapter {
       throw new Error(`Missing file: ${path}`);
     }
 
+    const extension = fileExtension(path);
+    if (isBinaryPreviewExtension(extension)) {
+      return {
+        path,
+        name: path.split("/").pop() ?? path,
+        content: "",
+        extension,
+        previewUrl: toDataUrl(content, extension),
+        mimeType: mimeTypeForExtension(extension),
+      };
+    }
+
     return {
       path,
       name: path.split("/").pop() ?? path,
       content,
-      extension: fileExtension(path),
+      extension,
     };
   }
 

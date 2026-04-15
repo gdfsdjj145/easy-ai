@@ -19,6 +19,7 @@ import {
   Settings2,
   Search,
   Sparkles,
+  X,
 } from "lucide-react";
 import {
   useEffect,
@@ -38,11 +39,23 @@ import {
   ThreadPrimitive,
   useLocalRuntime,
 } from "@assistant-ui/react";
+import { renderAsync as renderDocxAsync } from "docx-preview";
 import { LocalToolAgent } from "./lib/agent";
 import { BrowserFsAdapter } from "./lib/fs/browserFsAdapter";
 import { MockFsAdapter } from "./lib/fs/mockFsAdapter";
 import { TauriFsAdapter } from "./lib/fs/tauriFsAdapter";
-import { cn, createId, formatRelativeTime } from "./lib/utils";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { Document, Page, pdfjs } from "react-pdf";
+import * as XLSX from "xlsx";
+import {
+  cn,
+  createId,
+  formatRelativeTime,
+  isDocxExtension,
+  isImageExtension,
+  isPdfExtension,
+  isSpreadsheetExtension,
+} from "./lib/utils";
 import {
   loadSessionState,
   saveSessionState,
@@ -90,6 +103,8 @@ interface CreatingEntryState {
 const isBrowserFsSupported = typeof window !== "undefined" && "showDirectoryPicker" in window;
 const isTauriApp = typeof window !== "undefined" && isTauri();
 
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
 const navigationItems = [
   { key: "notes", label: "Notes", sublabel: "笔记", active: false, icon: <NotebookPen className="h-4 w-4" /> },
   { key: "canvas", label: "Canvas", sublabel: "帆布", active: false, icon: <LayoutPanelTop className="h-4 w-4" /> },
@@ -114,6 +129,7 @@ function App() {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [currentFile, setCurrentFile] = useState<FileRecord | null>(null);
   const [previewContent, setPreviewContent] = useState("");
+  const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [pendingWrite, setPendingWrite] = useState<PendingWrite | null>(null);
   const [isBusy, setIsBusy] = useState(false);
@@ -352,6 +368,10 @@ function App() {
       setSelectedEntryKind("file");
     }
   }, [currentFile]);
+
+  useEffect(() => {
+    setIsImagePreviewOpen(false);
+  }, [currentFile?.path]);
 
   useEffect(() => {
     dragWidthRef.current = leftWidth;
@@ -1060,11 +1080,20 @@ function App() {
                     ) : null}
                     <div className="mt-8 flex flex-wrap items-center gap-3 text-[12px] font-medium uppercase tracking-[0.16em] text-[#9b9388]">
                       <span>{currentFile.path}</span>
-                      <span>{previewContent ? previewContent.split(/\r?\n/).length : 0} Lines</span>
-                      <span>{previewContent.trim() ? previewContent.trim().split(/\s+/).length : 0} Words</span>
+                      <span>{currentFile.extension.toUpperCase() || "FILE"}</span>
+                      {isTextPreviewFileRecord(currentFile) ? (
+                        <span>{previewContent ? previewContent.split(/\r?\n/).length : 0} Lines</span>
+                      ) : null}
+                      {isTextPreviewFileRecord(currentFile) ? (
+                        <span>{previewContent.trim() ? previewContent.trim().split(/\s+/).length : 0} Words</span>
+                      ) : null}
                     </div>
                     <div className="mt-10 space-y-8">
-                      <PreviewBody content={previewContent} />
+                      <FilePreview
+                        file={currentFile}
+                        content={previewContent}
+                        onOpenImage={() => setIsImagePreviewOpen(true)}
+                      />
                     </div>
                   </article>
                 ) : (
@@ -1241,6 +1270,13 @@ function App() {
           onChange={handleCreateEntryDraftChange}
           onCancel={cancelCreateEntry}
           onConfirm={() => void confirmCreateEntry()}
+        />
+      ) : null}
+
+      {currentFile && isImageFileRecord(currentFile) && isImagePreviewOpen ? (
+        <ImagePreviewDialog
+          file={currentFile}
+          onClose={() => setIsImagePreviewOpen(false)}
         />
       ) : null}
 
@@ -1646,9 +1682,414 @@ function PreviewBody({ content }: { content: string }) {
   );
 }
 
+function FilePreview({
+  file,
+  content,
+  onOpenImage,
+}: {
+  file: FileRecord;
+  content: string;
+  onOpenImage: () => void;
+}) {
+  if (isImageFileRecord(file)) {
+    return <ImagePreview file={file} onOpen={onOpenImage} />;
+  }
+
+  if (isPdfFileRecord(file)) {
+    return <PdfPreview file={file} />;
+  }
+
+  if (isDocxFileRecord(file)) {
+    return <DocxPreview file={file} />;
+  }
+
+  if (isSpreadsheetFileRecord(file)) {
+    return <SpreadsheetPreview file={file} />;
+  }
+
+  return <PreviewBody content={content} />;
+}
+
+function useBinaryFileData(file: FileRecord) {
+  const [data, setData] = useState<Uint8Array | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let revoked = false;
+    setData(null);
+    setError("");
+
+    if (!file.previewUrl) {
+      setError("当前文件没有可用的预览数据。");
+      return;
+    }
+
+    void fetch(file.previewUrl)
+      .then(async (response) => {
+        const buffer = await response.arrayBuffer();
+        if (!revoked) {
+          setData(new Uint8Array(buffer));
+        }
+      })
+      .catch((reason) => {
+        if (!revoked) {
+          setError(String(reason));
+        }
+      });
+
+    return () => {
+      revoked = true;
+    };
+  }, [file.path, file.previewUrl]);
+
+  return { data, error };
+}
+
+function PdfPreview({ file }: { file: FileRecord }) {
+  const { data, error } = useBinaryFileData(file);
+  const [pageNumber, setPageNumber] = useState(1);
+  const [numPages, setNumPages] = useState(0);
+  const [pdfError, setPdfError] = useState("");
+
+  useEffect(() => {
+    setPageNumber(1);
+    setNumPages(0);
+    setPdfError("");
+  }, [file.path]);
+
+  return (
+    <div className="rounded-[28px] border border-[#ebe4d8] bg-[#fcfbf7] p-4 shadow-[0_10px_26px_rgba(31,31,31,0.05)]">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm leading-6 text-[#6c665f]">PDF 预览</p>
+        {numPages > 0 ? (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPageNumber((value) => Math.max(1, value - 1))}
+              disabled={pageNumber <= 1}
+              className="rounded-full border border-[#ddd6cc] bg-white px-3 py-1.5 text-xs font-semibold text-[#4a4640] disabled:opacity-40"
+            >
+              上一页
+            </button>
+            <span className="text-xs font-semibold uppercase tracking-[0.12em] text-[#938c84]">
+              {pageNumber} / {numPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => setPageNumber((value) => Math.min(numPages, value + 1))}
+              disabled={pageNumber >= numPages}
+              className="rounded-full border border-[#ddd6cc] bg-white px-3 py-1.5 text-xs font-semibold text-[#4a4640] disabled:opacity-40"
+            >
+              下一页
+            </button>
+          </div>
+        ) : null}
+      </div>
+
+      {error || pdfError ? (
+        <PreviewFallbackMessage message={`PDF 加载失败：${error || pdfError}`} />
+      ) : data ? (
+        <div className="mt-4 overflow-hidden rounded-[22px] border border-[#ece5d8] bg-white px-3 py-4">
+          <Document
+            file={{ data }}
+            loading={<PreviewFallbackMessage message="PDF 加载中…" compact />}
+            onLoadSuccess={({ numPages: nextNumPages }) => setNumPages(nextNumPages)}
+            onLoadError={(reason) => setPdfError(String(reason))}
+          >
+            <div className="flex justify-center overflow-x-auto">
+              <Page
+                pageNumber={pageNumber}
+                width={720}
+                renderAnnotationLayer={false}
+                renderTextLayer={false}
+              />
+            </div>
+          </Document>
+        </div>
+      ) : (
+        <PreviewFallbackMessage message="PDF 加载中…" />
+      )}
+    </div>
+  );
+}
+
+function DocxPreview({ file }: { file: FileRecord }) {
+  const { data, error } = useBinaryFileData(file);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [renderError, setRenderError] = useState("");
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !data) {
+      return;
+    }
+
+    container.innerHTML = "";
+    setRenderError("");
+
+    void renderDocxAsync(data, container, container, {
+      className: "docx-preview",
+      inWrapper: false,
+      useBase64URL: true,
+    }).catch((reason) => {
+      setRenderError(String(reason));
+    });
+
+    return () => {
+      container.innerHTML = "";
+    };
+  }, [data, file.path]);
+
+  return (
+    <div className="rounded-[28px] border border-[#ebe4d8] bg-[#fcfbf7] p-4 shadow-[0_10px_26px_rgba(31,31,31,0.05)]">
+      <p className="text-sm leading-6 text-[#6c665f]">Word 文档预览</p>
+      {error || renderError ? (
+        <PreviewFallbackMessage message={`Word 预览失败：${error || renderError}`} />
+      ) : !data ? (
+        <PreviewFallbackMessage message="Word 文档加载中…" />
+      ) : (
+        <div className="mt-4 overflow-x-auto rounded-[22px] border border-[#ece5d8] bg-white px-4 py-5">
+          <div ref={containerRef} className="docx-preview-host min-w-0 text-[#2f2c27]" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SpreadsheetPreview({ file }: { file: FileRecord }) {
+  const { data, error } = useBinaryFileData(file);
+  const [activeSheet, setActiveSheet] = useState("");
+  const [workbookData, setWorkbookData] = useState<{
+    sheetNames: string[];
+    sheets: Record<string, Array<Array<string | number | boolean | null>>>;
+  } | null>(null);
+  const [parseError, setParseError] = useState("");
+
+  useEffect(() => {
+    setWorkbookData(null);
+    setParseError("");
+    setActiveSheet("");
+
+    if (!data) {
+      return;
+    }
+
+    try {
+      const workbook = XLSX.read(data, { type: "array" });
+      const sheetNames = workbook.SheetNames;
+      const sheets = Object.fromEntries(
+        sheetNames.map((sheetName) => [
+          sheetName,
+          XLSX.utils.sheet_to_json<Array<string | number | boolean | null>>(workbook.Sheets[sheetName], {
+            header: 1,
+            blankrows: false,
+            defval: "",
+          }),
+        ]),
+      );
+
+      setWorkbookData({ sheetNames, sheets });
+      setActiveSheet(sheetNames[0] ?? "");
+    } catch (reason) {
+      setParseError(String(reason));
+    }
+  }, [data, file.path]);
+
+  const rows = activeSheet && workbookData ? workbookData.sheets[activeSheet] ?? [] : [];
+
+  return (
+    <div className="rounded-[28px] border border-[#ebe4d8] bg-[#fcfbf7] p-4 shadow-[0_10px_26px_rgba(31,31,31,0.05)]">
+      <p className="text-sm leading-6 text-[#6c665f]">表格预览</p>
+      {error || parseError ? (
+        <PreviewFallbackMessage message={`表格预览失败：${error || parseError}`} />
+      ) : !workbookData ? (
+        <PreviewFallbackMessage message="表格加载中…" />
+      ) : (
+        <>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {workbookData.sheetNames.map((sheetName) => (
+              <button
+                key={sheetName}
+                type="button"
+                onClick={() => setActiveSheet(sheetName)}
+                className={cn(
+                  "rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition",
+                  activeSheet === sheetName
+                    ? "border-[#1f1f1f] bg-[#1f1f1f] text-white"
+                    : "border-[#ddd6cc] bg-white text-[#4a4640] hover:bg-[#f8f4ef]",
+                )}
+              >
+                {sheetName}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4 overflow-x-auto rounded-[22px] border border-[#ece5d8] bg-white">
+            <table className="min-w-full border-collapse text-left text-sm text-[#383531]">
+              <tbody>
+                {rows.map((row, rowIndex) => (
+                  <tr key={`${activeSheet}-${rowIndex}`} className={rowIndex === 0 ? "bg-[#f6f1e9]" : ""}>
+                    {row.map((cell, cellIndex) => (
+                      <td
+                        key={`${activeSheet}-${rowIndex}-${cellIndex}`}
+                        className="border-b border-r border-[#f0ebe3] px-4 py-2.5 align-top last:border-r-0"
+                      >
+                        {String(cell ?? "")}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PreviewFallbackMessage({
+  message,
+  compact = false,
+}: {
+  message: string;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex items-center justify-center rounded-[20px] border border-dashed border-[#e1d9cd] bg-white/75 px-4 text-center text-sm leading-6 text-[#8b857e]",
+        compact ? "py-8" : "mt-4 py-12",
+      )}
+    >
+      {message}
+    </div>
+  );
+}
+
+function ImagePreview({
+  file,
+  onOpen,
+}: {
+  file: FileRecord;
+  onOpen: () => void;
+}) {
+  return (
+    <div className="overflow-hidden rounded-[28px] border border-[#ebe4d8] bg-[#fcfbf7] p-4 shadow-[0_10px_26px_rgba(31,31,31,0.05)]">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="group block w-full overflow-hidden rounded-[22px] bg-[#f4efe7] text-left"
+      >
+        <img
+          src={file.previewUrl}
+          alt={file.name}
+          className="max-h-[72vh] w-full object-contain transition duration-300 group-hover:scale-[1.01]"
+        />
+      </button>
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <p className="text-sm leading-6 text-[#6c665f]">
+          当前为图片预览。点击图片可放大查看。
+        </p>
+        <button
+          type="button"
+          onClick={onOpen}
+          className="rounded-full border border-[#ddd6cc] bg-white px-3 py-1.5 text-xs font-semibold text-[#4a4640] transition hover:bg-[#f8f4ef]"
+        >
+          放大查看
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ImagePreviewDialog({
+  file,
+  onClose,
+}: {
+  file: FileRecord;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-[rgba(18,18,18,0.82)] px-4 py-6 backdrop-blur-sm">
+      <button
+        type="button"
+        aria-label="关闭图片预览"
+        onClick={onClose}
+        className="absolute right-5 top-5 z-20 inline-flex h-11 w-11 items-center justify-center rounded-full border border-white/15 bg-white/10 text-white transition hover:bg-white/20"
+      >
+        <X className="h-5 w-5" />
+      </button>
+      <button
+        type="button"
+        onClick={onClose}
+        className="absolute inset-0 cursor-zoom-out"
+        aria-hidden="true"
+      />
+      <div className="relative z-10 flex max-h-full max-w-6xl flex-col items-center gap-4">
+        <img
+          src={file.previewUrl}
+          alt={file.name}
+          className="max-h-[82vh] max-w-full rounded-[24px] object-contain shadow-[0_24px_80px_rgba(0,0,0,0.35)]"
+        />
+        <div className="rounded-full bg-white/10 px-4 py-2 text-xs font-medium tracking-[0.12em] text-white/78">
+          {file.name}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function isImageFileRecord(file: FileRecord | null) {
+  return !!file && isImageExtension(file.extension) && !!file.previewUrl;
+}
+
+function isPdfFileRecord(file: FileRecord | null) {
+  return !!file && isPdfExtension(file.extension) && !!file.previewUrl;
+}
+
+function isDocxFileRecord(file: FileRecord | null) {
+  return !!file && isDocxExtension(file.extension) && !!file.previewUrl;
+}
+
+function isSpreadsheetFileRecord(file: FileRecord | null) {
+  return !!file && isSpreadsheetExtension(file.extension) && !!file.previewUrl;
+}
+
+function isTextPreviewFileRecord(file: FileRecord | null) {
+  return !!file && !isImageFileRecord(file) && !isPdfFileRecord(file) && !isDocxFileRecord(file) && !isSpreadsheetFileRecord(file);
+}
+
 function getPreviewMeta(file: FileRecord | null, content: string) {
   if (!file) {
     return { title: "空白文档", lead: "" };
+  }
+
+  if (isImageFileRecord(file)) {
+    return {
+      title: prettifyFileName(file.name),
+      lead: "图片预览",
+    };
+  }
+
+  if (isPdfFileRecord(file)) {
+    return {
+      title: prettifyFileName(file.name),
+      lead: "PDF 预览",
+    };
+  }
+
+  if (isDocxFileRecord(file)) {
+    return {
+      title: prettifyFileName(file.name),
+      lead: "Word 文档预览",
+    };
+  }
+
+  if (isSpreadsheetFileRecord(file)) {
+    return {
+      title: prettifyFileName(file.name),
+      lead: "表格预览",
+    };
   }
 
   const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
