@@ -81,6 +81,12 @@ interface RenamingEntryState {
   draft: string;
 }
 
+interface CreatingEntryState {
+  kind: "file" | "directory";
+  baseDirectory: string;
+  draft: string;
+}
+
 const isBrowserFsSupported = typeof window !== "undefined" && "showDirectoryPicker" in window;
 const isTauriApp = typeof window !== "undefined" && isTauri();
 
@@ -120,6 +126,7 @@ function App() {
   const [selectedEntryKind, setSelectedEntryKind] = useState<"file" | "directory" | null>(null);
   const [contextMenu, setContextMenu] = useState<ExplorerContextMenuState | null>(null);
   const [renamingEntry, setRenamingEntry] = useState<RenamingEntryState | null>(null);
+  const [creatingEntry, setCreatingEntry] = useState<CreatingEntryState | null>(null);
   const [installedAgents, setInstalledAgents] = useState<InstalledAgent[]>([]);
   const [activeAgentId, setActiveAgentId] = useState<"claude" | "codex">("claude");
   const [agentApiKey, setAgentApiKey] = useState(session.agentApiKey ?? "");
@@ -512,6 +519,7 @@ function App() {
     setSelectedEntryKind("file");
     setContextMenu(null);
     setRenamingEntry(null);
+    setCreatingEntry(null);
     setSession((previous) => ({
       ...previous,
       currentFilePath: file.path,
@@ -541,6 +549,7 @@ function App() {
     setSelectedEntryKind(kind);
     setContextMenu({ path, kind, name, x: event.clientX, y: event.clientY });
     setRenamingEntry(null);
+    setCreatingEntry(null);
   }
 
   function handleExplorerNodeClick(
@@ -573,42 +582,66 @@ function App() {
     setEntries(await adapter.listDir());
   }
 
-  async function handleCreateFile() {
-    const baseDirectory =
-      selectedEntryKind === "directory"
-        ? selectedEntryPath
-        : selectedEntryPath?.split("/").slice(0, -1).join("/") || "";
-    const name = window.prompt("输入新文件名", "new-note.md");
-    if (!name?.trim()) {
-      return;
-    }
-
-    const path = baseDirectory ? `${baseDirectory}/${name.trim()}` : name.trim();
-    await adapter.createFile(path, "");
-    await refreshExplorer();
-    setContextMenu(null);
-    setRenamingEntry(null);
-    await handleOpenFile(path);
+  function getCreateBaseDirectory() {
+    return selectedEntryKind === "directory"
+      ? selectedEntryPath ?? ""
+      : selectedEntryPath?.split("/").slice(0, -1).join("/") || "";
   }
 
-  async function handleCreateDirectory() {
-    const baseDirectory =
-      selectedEntryKind === "directory"
-        ? selectedEntryPath
-        : selectedEntryPath?.split("/").slice(0, -1).join("/") || "";
-    const name = window.prompt("输入新文件夹名", "new-folder");
-    if (!name?.trim()) {
+  function handleCreateFile() {
+    setContextMenu(null);
+    setRenamingEntry(null);
+    setCreatingEntry({
+      kind: "file",
+      baseDirectory: getCreateBaseDirectory(),
+      draft: "new-note.md",
+    });
+  }
+
+  function handleCreateDirectory() {
+    setContextMenu(null);
+    setRenamingEntry(null);
+    setCreatingEntry({
+      kind: "directory",
+      baseDirectory: getCreateBaseDirectory(),
+      draft: "new-folder",
+    });
+  }
+
+  function handleCreateEntryDraftChange(nextValue: string) {
+    setCreatingEntry((previous) => (previous ? { ...previous, draft: nextValue } : previous));
+  }
+
+  function cancelCreateEntry() {
+    setCreatingEntry(null);
+  }
+
+  async function confirmCreateEntry() {
+    if (!creatingEntry?.draft.trim()) {
       return;
     }
 
-    const path = baseDirectory ? `${baseDirectory}/${name.trim()}` : name.trim();
+    const entry = creatingEntry;
+    const name = entry.draft.trim();
+    const path = entry.baseDirectory ? `${entry.baseDirectory}/${name}` : name;
+    setCreatingEntry(null);
+
+    if (entry.kind === "file") {
+      await adapter.createFile(path, "");
+      await refreshExplorer();
+      setContextMenu(null);
+      setRenamingEntry(null);
+      await handleOpenFile(path);
+      return;
+    }
+
     await adapter.createDirectory(path);
     await refreshExplorer();
     setSelectedEntryPath(path);
     setSelectedEntryKind("directory");
     setContextMenu(null);
     setRenamingEntry(null);
-    setExpandedFolders((previous) => Array.from(new Set([...previous, path])));
+    setExpandedFolders((previous) => Array.from(new Set([...previous, entry.baseDirectory, path].filter(Boolean))));
   }
 
   function handleRenameEntry(targetPath = selectedEntryPath, targetKind = selectedEntryKind) {
@@ -621,6 +654,7 @@ function App() {
     const currentName = targetPath.split("/").pop() ?? targetPath;
     setSelectedEntryPath(targetPath);
     setSelectedEntryKind(targetKind);
+    setCreatingEntry(null);
     setRenamingEntry({
       path: targetPath,
       kind: targetKind,
@@ -697,6 +731,7 @@ function App() {
 
     setContextMenu(null);
     setRenamingEntry(null);
+    setCreatingEntry(null);
     const confirmed = window.confirm(buildDeleteConfirmation(targetPath, targetKind, entries));
     if (!confirmed) {
       return;
@@ -1195,6 +1230,17 @@ function App() {
           kind={contextMenu.kind}
           onRename={() => void handleRenameEntry(contextMenu.path, contextMenu.kind)}
           onDelete={() => void handleDeleteEntry(contextMenu.path, contextMenu.kind)}
+        />
+      ) : null}
+
+      {creatingEntry ? (
+        <CreateEntryDialog
+          kind={creatingEntry.kind}
+          baseDirectory={creatingEntry.baseDirectory}
+          value={creatingEntry.draft}
+          onChange={handleCreateEntryDraftChange}
+          onCancel={cancelCreateEntry}
+          onConfirm={() => void confirmCreateEntry()}
         />
       ) : null}
 
@@ -1929,6 +1975,80 @@ function ExplorerContextMenuItem({
     >
       {label}
     </button>
+  );
+}
+
+function CreateEntryDialog({
+  kind,
+  baseDirectory,
+  value,
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  kind: "file" | "directory";
+  baseDirectory: string;
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const title = kind === "file" ? "新建文件" : "新建文件夹";
+  const targetLabel = baseDirectory || "工作区根目录";
+
+  return (
+    <div className="fixed inset-0 z-30 flex items-end justify-center bg-[rgba(24,24,24,0.18)] px-4 py-6 backdrop-blur-sm md:items-center">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        className="w-full max-w-lg rounded-[28px] border border-white/80 bg-[#fffdfa] p-6 shadow-[0_30px_90px_rgba(0,0,0,0.16)]"
+      >
+        <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-[#9a948b]">
+          {kind === "file" ? "Create File" : "Create Folder"}
+        </p>
+        <h2 className="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-[#222221]">{title}</h2>
+        <p className="mt-4 text-sm leading-7 text-[#5a574f]">
+          目标位置：<span className="font-medium text-[#2f2d29]">{targetLabel}</span>
+        </p>
+        <input
+          aria-label={title}
+          autoFocus
+          value={value}
+          onFocus={(event) => event.currentTarget.select()}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onConfirm();
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              onCancel();
+            }
+          }}
+          className="mt-4 w-full rounded-[18px] border border-[#e4ddd4] bg-white px-4 py-3 text-sm text-[#2f2d29] outline-none placeholder:text-[#b5aea3]"
+          placeholder={kind === "file" ? "输入文件名，例如 draft.md" : "输入文件夹名"}
+        />
+        <div className="mt-5 flex flex-wrap gap-3">
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!value.trim()}
+            className="rounded-full bg-[#151515] px-6 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#c9c3bb]"
+          >
+            创建
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-full border border-[#ddd7ce] bg-white px-6 py-3 text-sm font-semibold text-[#44423f]"
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

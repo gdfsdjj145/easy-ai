@@ -57,19 +57,42 @@ describe("App", () => {
     });
     window.dispatchEvent(new Event("resize"));
 
-    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("draft.md");
-
     const user = userEvent.setup();
     render(<App />);
 
     await screen.findAllByText("Mock Workspace");
     await user.click(screen.getAllByRole("button", { name: "新建文件" })[0]);
+    const createInput = screen.getByRole("textbox", { name: "新建文件" });
+
+    await user.clear(createInput);
+    await user.type(createInput, "draft.md{enter}");
 
     await waitFor(() => {
       expect(screen.getAllByText("draft.md").length).toBeGreaterThan(0);
     });
+  });
 
-    promptSpy.mockRestore();
+  it("supports creating a folder from the explorer actions", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 1440,
+    });
+    window.dispatchEvent(new Event("resize"));
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findAllByText("Mock Workspace");
+    await user.click(screen.getAllByRole("button", { name: "新建文件夹" })[0]);
+    const createInput = screen.getByRole("textbox", { name: "新建文件夹" });
+
+    await user.clear(createInput);
+    await user.type(createInput, "assets{enter}");
+
+    await waitFor(() => {
+      expect(screen.getAllByText("assets").length).toBeGreaterThan(0);
+    });
   });
 
   it("supports renaming the selected explorer entry", async () => {
