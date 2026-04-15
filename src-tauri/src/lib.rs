@@ -582,12 +582,24 @@ fn read_cc_switch_api_key(agent_id: &str) -> Result<Option<String>, String> {
 }
 
 fn command_exists(command: &str) -> bool {
-  Command::new("sh")
-    .arg("-lc")
-    .arg(format!("command -v {command} >/dev/null 2>&1"))
-    .status()
-    .map(|status| status.success())
-    .unwrap_or(false)
+  #[cfg(target_os = "windows")]
+  {
+    Command::new("cmd")
+      .args(["/C", &format!("where {command} >nul 2>&1")])
+      .status()
+      .map(|status| status.success())
+      .unwrap_or(false)
+  }
+
+  #[cfg(not(target_os = "windows"))]
+  {
+    Command::new("sh")
+      .arg("-lc")
+      .arg(format!("command -v {command} >/dev/null 2>&1"))
+      .status()
+      .map(|status| status.success())
+      .unwrap_or(false)
+  }
 }
 
 fn updater_endpoint() -> &'static str {
