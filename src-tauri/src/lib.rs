@@ -524,9 +524,9 @@ fn resolve_agent_api_key(agent_id: &str, explicit_api_key: &str) -> Result<Strin
 }
 
 fn read_cc_switch_api_key(agent_id: &str) -> Result<Option<String>, String> {
-  let home_dir = std::env::var("HOME").map_err(|error| format!("读取 HOME 失败：{error}"))?;
-  let settings_path = PathBuf::from(&home_dir).join(".cc-switch/settings.json");
-  let db_path = PathBuf::from(&home_dir).join(".cc-switch/cc-switch.db");
+  let home_dir = resolve_home_dir()?;
+  let settings_path = home_dir.join(".cc-switch/settings.json");
+  let db_path = home_dir.join(".cc-switch/cc-switch.db");
 
   if !settings_path.exists() || !db_path.exists() {
     return Ok(None);
@@ -579,6 +579,35 @@ fn read_cc_switch_api_key(agent_id: &str) -> Result<Option<String>, String> {
   };
 
   Ok(maybe_key.filter(|value| !value.trim().is_empty()).map(ToString::to_string))
+}
+
+fn resolve_home_dir() -> Result<PathBuf, String> {
+  #[cfg(target_os = "windows")]
+  {
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+      return Ok(PathBuf::from(profile));
+    }
+
+    let home_drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty());
+    let home_path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty());
+    if let (Some(home_drive), Some(home_path)) = (home_drive, home_path) {
+      return Ok(PathBuf::from(format!(
+        "{}{}",
+        home_drive.to_string_lossy(),
+        home_path.to_string_lossy()
+      )));
+    }
+
+    Err("读取用户目录失败：未找到 USERPROFILE 或 HOMEDRIVE/HOMEPATH。".into())
+  }
+
+  #[cfg(not(target_os = "windows"))]
+  {
+    std::env::var_os("HOME")
+      .filter(|value| !value.is_empty())
+      .map(PathBuf::from)
+      .ok_or_else(|| "读取用户目录失败：未找到 HOME。".into())
+  }
 }
 
 fn command_exists(command: &str) -> bool {
