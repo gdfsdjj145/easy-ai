@@ -1,7 +1,5 @@
-use rusqlite::{params, Connection, OptionalExtension};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
@@ -92,13 +90,6 @@ struct AgentLogEvent {
   agent_id: String,
   kind: String,
   text: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CcSwitchSettings {
-  current_provider_claude: Option<String>,
-  current_provider_codex: Option<String>,
 }
 
 #[tauri::command]
@@ -556,104 +547,13 @@ fn emit_agent_log(app: &AppHandle, request_id: &str, agent_id: &str, kind: &str,
   );
 }
 
-fn resolve_agent_api_key(agent_id: &str, explicit_api_key: &str) -> Result<String, String> {
+fn resolve_agent_api_key(_agent_id: &str, explicit_api_key: &str) -> Result<String, String> {
   let trimmed = explicit_api_key.trim();
   if !trimmed.is_empty() {
     return Ok(trimmed.to_string());
   }
 
-  if let Some(local_key) = read_cc_switch_api_key(agent_id)? {
-    return Ok(local_key);
-  }
-
-  Err("请先在设置页填写 API Key，或确保本机 cc-switch 已配置当前 provider。".into())
-}
-
-fn read_cc_switch_api_key(agent_id: &str) -> Result<Option<String>, String> {
-  let home_dir = resolve_home_dir()?;
-  let settings_path = home_dir.join(".cc-switch/settings.json");
-  let db_path = home_dir.join(".cc-switch/cc-switch.db");
-
-  if !settings_path.exists() || !db_path.exists() {
-    return Ok(None);
-  }
-
-  let settings_raw = fs::read_to_string(&settings_path)
-    .map_err(|error| format!("读取 cc-switch settings 失败：{error}"))?;
-  let settings: CcSwitchSettings = serde_json::from_str(&settings_raw)
-    .map_err(|error| format!("解析 cc-switch settings 失败：{error}"))?;
-
-  let provider_id = match agent_id {
-    "claude" => settings.current_provider_claude,
-    "codex" => settings.current_provider_codex,
-    _ => None,
-  };
-
-  let Some(provider_id) = provider_id else {
-    return Ok(None);
-  };
-
-  let connection = Connection::open(db_path)
-    .map_err(|error| format!("打开 cc-switch 数据库失败：{error}"))?;
-
-  let mut statement = connection
-    .prepare("SELECT settings_config FROM providers WHERE id = ?1 AND app_type = ?2 LIMIT 1")
-    .map_err(|error| format!("查询 cc-switch provider 失败：{error}"))?;
-
-  let settings_config: Option<String> = statement
-    .query_row(params![provider_id, agent_id], |row| row.get(0))
-    .optional()
-    .map_err(|error| format!("读取 cc-switch provider 配置失败：{error}"))?;
-
-  let Some(settings_config) = settings_config else {
-    return Ok(None);
-  };
-
-  let config_value: Value = serde_json::from_str(&settings_config)
-    .map_err(|error| format!("解析 provider 配置失败：{error}"))?;
-
-  let maybe_key = match agent_id {
-    "claude" => config_value
-      .get("env")
-      .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN").or_else(|| env.get("ANTHROPIC_API_KEY")))
-      .and_then(Value::as_str),
-    "codex" => config_value
-      .get("auth")
-      .and_then(|auth| auth.get("OPENAI_API_KEY"))
-      .and_then(Value::as_str),
-    _ => None,
-  };
-
-  Ok(maybe_key.filter(|value| !value.trim().is_empty()).map(ToString::to_string))
-}
-
-fn resolve_home_dir() -> Result<PathBuf, String> {
-  #[cfg(target_os = "windows")]
-  {
-    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-      return Ok(PathBuf::from(profile));
-    }
-
-    let home_drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty());
-    let home_path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty());
-    if let (Some(home_drive), Some(home_path)) = (home_drive, home_path) {
-      return Ok(PathBuf::from(format!(
-        "{}{}",
-        home_drive.to_string_lossy(),
-        home_path.to_string_lossy()
-      )));
-    }
-
-    Err("读取用户目录失败：未找到 USERPROFILE 或 HOMEDRIVE/HOMEPATH。".into())
-  }
-
-  #[cfg(not(target_os = "windows"))]
-  {
-    std::env::var_os("HOME")
-      .filter(|value| !value.is_empty())
-      .map(PathBuf::from)
-      .ok_or_else(|| "读取用户目录失败：未找到 HOME。".into())
-  }
+  Ok(String::new())
 }
 
 fn command_exists(command: &str) -> bool {
@@ -763,10 +663,14 @@ fn run_claude_chat_no_log(
     .arg("--output-format")
     .arg("text")
     .arg("--tools")
-    .arg("")
-    .env("ANTHROPIC_BASE_URL", DEFAULT_AGENT_BASE_URL)
-    .env("ANTHROPIC_API_KEY", api_key)
-    .env("ANTHROPIC_AUTH_TOKEN", api_key);
+    .arg("");
+
+  if !api_key.trim().is_empty() {
+    command
+      .env("ANTHROPIC_BASE_URL", DEFAULT_AGENT_BASE_URL)
+      .env("ANTHROPIC_API_KEY", api_key)
+      .env("ANTHROPIC_AUTH_TOKEN", api_key);
+  }
 
   if let Some(workspace_path) = workspace_path {
     command.arg("--add-dir").arg(workspace_path);
@@ -792,10 +696,14 @@ fn run_claude_chat_with_timeout(
     .arg("--output-format")
     .arg("text")
     .arg("--tools")
-    .arg("")
-    .env("ANTHROPIC_BASE_URL", DEFAULT_AGENT_BASE_URL)
-    .env("ANTHROPIC_API_KEY", api_key)
-    .env("ANTHROPIC_AUTH_TOKEN", api_key);
+    .arg("");
+
+  if !api_key.trim().is_empty() {
+    command
+      .env("ANTHROPIC_BASE_URL", DEFAULT_AGENT_BASE_URL)
+      .env("ANTHROPIC_API_KEY", api_key)
+      .env("ANTHROPIC_AUTH_TOKEN", api_key);
+  }
 
   if let Some(workspace_path) = workspace_path {
     command.arg("--add-dir").arg(workspace_path);
@@ -876,8 +784,11 @@ fn run_codex_chat_no_log(
     .arg("-c")
     .arg(format!("openai_base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
     .arg("-o")
-    .arg(&output_path)
-    .env("OPENAI_API_KEY", api_key);
+    .arg(&output_path);
+
+  if !api_key.trim().is_empty() {
+    command.env("OPENAI_API_KEY", api_key);
+  }
 
   if let Some(workspace_path) = workspace_path {
     command.arg("-C").arg(workspace_path);
@@ -940,8 +851,11 @@ fn run_codex_chat_with_timeout(
     .arg("-c")
     .arg(format!("openai_base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
     .arg("-o")
-    .arg(&output_path)
-    .env("OPENAI_API_KEY", api_key);
+    .arg(&output_path);
+
+  if !api_key.trim().is_empty() {
+    command.env("OPENAI_API_KEY", api_key);
+  }
 
   if let Some(workspace_path) = workspace_path {
     command.arg("-C").arg(workspace_path);

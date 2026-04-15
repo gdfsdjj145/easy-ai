@@ -13,12 +13,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: --target aarch64-apple-darwin
-            targets: aarch64-apple-darwin
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin
-            targets: x86_64-apple-darwin
+          - platform: macos-14
+            args: ""
+            targets: ""
+          - platform: macos-13
+            args: ""
+            targets: ""
           - platform: ubuntu-22.04
             args: ""
             targets: ""
