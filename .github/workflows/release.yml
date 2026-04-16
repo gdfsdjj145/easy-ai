@@ -13,10 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-14
-            args: ""
-            targets: ""
-          - platform: macos-13
+          - platform: macos-latest
             args: ""
             targets: ""
           - platform: ubuntu-22.04
