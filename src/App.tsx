@@ -281,6 +281,7 @@ function App() {
       async run({ messages }) {
         setIsAgentRunning(true);
         const latestPrompt = extractLatestUserText(messages);
+        const conversationHistory = buildConversationHistory(messages);
         const activeCliAgent = installedAgentsRef.current.find(
           (item) => item.id === activeAgentIdRef.current && item.available,
         );
@@ -299,10 +300,7 @@ function App() {
                 workspacePath: workspaceRef.current.path,
                 currentFilePath: currentFileRef.current?.path ?? null,
                 currentFileContent: previewContentRef.current || null,
-                conversationHistory: messages.map((message) => {
-                  const role = message.role === "assistant" ? "助手" : "用户";
-                  return `${role}：${extractThreadMessageText(message.content)}`;
-                }),
+                conversationHistory,
               },
             });
 
@@ -2538,6 +2536,22 @@ function summarizeConversation(messages: ConversationMessage[]) {
 function extractLatestUserText(messages: readonly { role: string; content: unknown }[]) {
   const userMessage = [...messages].reverse().find((message) => message.role === "user");
   return userMessage ? extractThreadMessageText(userMessage.content) : "";
+}
+
+function buildConversationHistory(messages: readonly { role: string; content: unknown }[]) {
+  const latestUserIndex = [...messages]
+    .map((message, index) => ({ message, index }))
+    .reverse()
+    .find(({ message }) => message.role === "user")?.index;
+
+  return messages
+    .filter((_, index) => index !== latestUserIndex)
+    .map((message) => {
+      const role = message.role === "assistant" ? "助手" : "用户";
+      const text = extractThreadMessageText(message.content);
+      return text ? `${role}：${text}` : "";
+    })
+    .filter(Boolean);
 }
 
 function extractThreadMessageText(content: unknown): string {

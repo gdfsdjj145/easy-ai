@@ -796,7 +796,8 @@ fn run_codex_chat_no_log(
     .arg("-c")
     .arg(format!("openai_base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
     .arg("-o")
-    .arg(&output_path);
+    .arg(&output_path)
+    .arg("-");
 
   if !api_key.trim().is_empty() {
     command.env("OPENAI_API_KEY", api_key);
@@ -806,8 +807,7 @@ fn run_codex_chat_no_log(
     command.arg("-C").arg(workspace_path);
   }
 
-  command.arg(prompt);
-  let output = run_command_with_timeout_silent(command, timeout, "Codex CLI", None)?;
+  let output = run_command_with_timeout_silent(command, timeout, "Codex CLI", Some(prompt.as_bytes()))?;
 
   if !output.status.success() {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -863,7 +863,8 @@ fn run_codex_chat_with_timeout(
     .arg("-c")
     .arg(format!("openai_base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
     .arg("-o")
-    .arg(&output_path);
+    .arg(&output_path)
+    .arg("-");
 
   if !api_key.trim().is_empty() {
     command.env("OPENAI_API_KEY", api_key);
@@ -873,7 +874,6 @@ fn run_codex_chat_with_timeout(
     command.arg("-C").arg(workspace_path);
   }
 
-  command.arg(prompt);
   let output = run_command_with_timeout(
     app,
     request_id,
@@ -881,7 +881,7 @@ fn run_codex_chat_with_timeout(
     command,
     timeout,
     "Codex CLI",
-    None,
+    Some(prompt.as_bytes()),
     true,
   )?;
 
