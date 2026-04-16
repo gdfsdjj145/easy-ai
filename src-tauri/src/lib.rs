@@ -13,6 +13,18 @@ use tauri_plugin_updater::UpdaterExt;
 
 const DEFAULT_AGENT_BASE_URL: &str = "https://codecli.shop";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+
+#[cfg(target_os = "windows")]
+fn codex_command() -> Command {
+  let mut cmd = Command::new("cmd");
+  cmd.arg("/C").arg("codex");
+  cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+fn codex_command() -> Command {
+  Command::new("codex")
+}
 const DEFAULT_UPDATER_ENDPOINT: &str =
   "https://github.com/gdfsdjj145/easy-ai/releases/latest/download/latest.json";
 const DEFAULT_UPDATER_PUBKEY: &str = include_str!("../keys/updater.key.pub");
@@ -771,7 +783,7 @@ fn run_codex_chat_no_log(
   );
   let output_path = std::env::temp_dir().join(temp_name);
 
-  let mut command = Command::new("codex");
+  let mut command = codex_command();
   command
     .arg("exec")
     .arg("--skip-git-repo-check")
@@ -838,7 +850,7 @@ fn run_codex_chat_with_timeout(
   );
   let output_path = std::env::temp_dir().join(temp_name);
 
-  let mut command = Command::new("codex");
+  let mut command = codex_command();
   command
     .arg("exec")
     .arg("--skip-git-repo-check")
