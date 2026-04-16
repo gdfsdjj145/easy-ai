@@ -1,7 +1,7 @@
 {
   "name": "easy-ai",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.7",
   "repository": "git@github.com:gdfsdjj145/easy-ai.git",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
+    "version:check": "node scripts/check-version-sync.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
