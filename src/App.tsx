@@ -1591,7 +1591,7 @@ function SettingsView({
         <div className="mt-6 rounded-[24px] border border-[#ebe4d9] bg-[#fbfaf7] p-5">
           <p className="text-[16px] font-semibold text-[#2d2b27]">API Key</p>
           <p className="mt-1 text-sm text-[#8f8a83]">
-            默认 API 地址已经内置为 `https://codecli.shop`。这里填写后，Claude Code 和 Codex CLI 都会共用这把 key。
+            默认 API 地址已经内置为 `https://codecli.shop`，请求失败时会自动降级到 `http://66.253.42.202:3000/api`。这里填写后，Claude Code 和 Codex CLI 都会共用这把 key。
           </p>
           <div className="mt-4 flex gap-2">
             <input

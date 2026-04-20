@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
 const DEFAULT_AGENT_BASE_URL: &str = "https://codecli.shop";
+const FALLBACK_AGENT_BASE_URL: &str = "http://66.253.42.202:3000/api";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 
 #[cfg(target_os = "windows")]
@@ -644,6 +645,31 @@ fn build_chat_prompt(prompt: &str, context: &ChatContextPayload) -> String {
   blocks.join("\n\n")
 }
 
+fn agent_base_urls() -> [&'static str; 2] {
+  [DEFAULT_AGENT_BASE_URL, FALLBACK_AGENT_BASE_URL]
+}
+
+fn should_retry_with_fallback(error: &str) -> bool {
+  let normalized = error.to_lowercase();
+  [
+    "stream disconnected before completion",
+    "error sending request for url",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "timed out",
+    "timeout",
+    "dns",
+    "tls",
+    "handshake",
+    "broken pipe",
+    "unexpected eof",
+    "network",
+  ]
+  .iter()
+  .any(|pattern| normalized.contains(pattern))
+}
+
 fn run_claude_chat(
   app: &AppHandle,
   request_id: &str,
@@ -669,6 +695,24 @@ fn run_claude_chat_no_log(
   api_key: &str,
   timeout: Duration,
 ) -> Result<String, String> {
+  for (index, base_url) in agent_base_urls().iter().enumerate() {
+    match run_claude_chat_no_log_with_base_url(&prompt, workspace_path, api_key, timeout, base_url) {
+      Ok(reply) => return Ok(reply),
+      Err(error) if index == 0 && should_retry_with_fallback(&error) => continue,
+      Err(error) => return Err(error),
+    }
+  }
+
+  Err("Claude Code 调用失败。".into())
+}
+
+fn run_claude_chat_no_log_with_base_url(
+  prompt: &str,
+  workspace_path: Option<&str>,
+  api_key: &str,
+  timeout: Duration,
+  base_url: &str,
+) -> Result<String, String> {
   let mut command = Command::new("claude");
   command
     .arg("-p")
@@ -679,7 +723,7 @@ fn run_claude_chat_no_log(
 
   if !api_key.trim().is_empty() {
     command
-      .env("ANTHROPIC_BASE_URL", DEFAULT_AGENT_BASE_URL)
+      .env("ANTHROPIC_BASE_URL", base_url)
       .env("ANTHROPIC_API_KEY", api_key)
       .env("ANTHROPIC_AUTH_TOKEN", api_key);
   }
@@ -702,6 +746,44 @@ fn run_claude_chat_with_timeout(
   timeout: Duration,
 ) -> Result<String, String> {
   emit_agent_log(app, request_id, agent_id, "status", "启动 Claude Code");
+  for (index, base_url) in agent_base_urls().iter().enumerate() {
+    match run_claude_chat_with_timeout_using_base_url(
+      app,
+      request_id,
+      agent_id,
+      &prompt,
+      workspace_path,
+      api_key,
+      timeout,
+      base_url,
+    ) {
+      Ok(reply) => return Ok(reply),
+      Err(error) if index == 0 && should_retry_with_fallback(&error) => {
+        emit_agent_log(
+          app,
+          request_id,
+          agent_id,
+          "status",
+          &format!("主地址请求失败，尝试降级到 {FALLBACK_AGENT_BASE_URL}"),
+        );
+      }
+      Err(error) => return Err(error),
+    }
+  }
+
+  Err("Claude Code 调用失败。".into())
+}
+
+fn run_claude_chat_with_timeout_using_base_url(
+  app: &AppHandle,
+  request_id: &str,
+  agent_id: &str,
+  prompt: &str,
+  workspace_path: Option<&str>,
+  api_key: &str,
+  timeout: Duration,
+  base_url: &str,
+) -> Result<String, String> {
   let mut command = Command::new("claude");
   command
     .arg("-p")
@@ -712,7 +794,7 @@ fn run_claude_chat_with_timeout(
 
   if !api_key.trim().is_empty() {
     command
-      .env("ANTHROPIC_BASE_URL", DEFAULT_AGENT_BASE_URL)
+      .env("ANTHROPIC_BASE_URL", base_url)
       .env("ANTHROPIC_API_KEY", api_key)
       .env("ANTHROPIC_AUTH_TOKEN", api_key);
   }
@@ -774,6 +856,24 @@ fn run_codex_chat_no_log(
   api_key: &str,
   timeout: Duration,
 ) -> Result<String, String> {
+  for (index, base_url) in agent_base_urls().iter().enumerate() {
+    match run_codex_chat_no_log_with_base_url(&prompt, workspace_path, api_key, timeout, base_url) {
+      Ok(reply) => return Ok(reply),
+      Err(error) if index == 0 && should_retry_with_fallback(&error) => continue,
+      Err(error) => return Err(error),
+    }
+  }
+
+  Err("Codex CLI 调用失败。".into())
+}
+
+fn run_codex_chat_no_log_with_base_url(
+  prompt: &str,
+  workspace_path: Option<&str>,
+  api_key: &str,
+  timeout: Duration,
+  base_url: &str,
+) -> Result<String, String> {
   let temp_name = format!(
     "easy-ai-codex-{}.txt",
     SystemTime::now()
@@ -792,9 +892,9 @@ fn run_codex_chat_no_log(
     .arg("--model")
     .arg(DEFAULT_CODEX_MODEL)
     .arg("-c")
-    .arg(format!("base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
+    .arg(format!("base_url=\"{}\"", base_url))
     .arg("-c")
-    .arg(format!("openai_base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
+    .arg(format!("openai_base_url=\"{}\"", base_url))
     .arg("-o")
     .arg(&output_path)
     .arg("-");
@@ -841,6 +941,44 @@ fn run_codex_chat_with_timeout(
   timeout: Duration,
 ) -> Result<String, String> {
   emit_agent_log(app, request_id, agent_id, "status", "启动 Codex CLI");
+  for (index, base_url) in agent_base_urls().iter().enumerate() {
+    match run_codex_chat_with_timeout_using_base_url(
+      app,
+      request_id,
+      agent_id,
+      &prompt,
+      workspace_path,
+      api_key,
+      timeout,
+      base_url,
+    ) {
+      Ok(reply) => return Ok(reply),
+      Err(error) if index == 0 && should_retry_with_fallback(&error) => {
+        emit_agent_log(
+          app,
+          request_id,
+          agent_id,
+          "status",
+          &format!("主地址请求失败，尝试降级到 {FALLBACK_AGENT_BASE_URL}"),
+        );
+      }
+      Err(error) => return Err(error),
+    }
+  }
+
+  Err("Codex CLI 调用失败。".into())
+}
+
+fn run_codex_chat_with_timeout_using_base_url(
+  app: &AppHandle,
+  request_id: &str,
+  agent_id: &str,
+  prompt: &str,
+  workspace_path: Option<&str>,
+  api_key: &str,
+  timeout: Duration,
+  base_url: &str,
+) -> Result<String, String> {
   let temp_name = format!(
     "easy-ai-codex-{}.txt",
     SystemTime::now()
@@ -859,9 +997,9 @@ fn run_codex_chat_with_timeout(
     .arg("--model")
     .arg(DEFAULT_CODEX_MODEL)
     .arg("-c")
-    .arg(format!("base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
+    .arg(format!("base_url=\"{}\"", base_url))
     .arg("-c")
-    .arg(format!("openai_base_url=\"{}\"", DEFAULT_AGENT_BASE_URL))
+    .arg(format!("openai_base_url=\"{}\"", base_url))
     .arg("-o")
     .arg(&output_path)
     .arg("-");
