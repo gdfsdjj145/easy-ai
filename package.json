@@ -1,7 +1,7 @@
 {
   "name": "easy-ai",
   "private": true,
-  "version": "0.1.9",
+  "version": "0.1.10",
   "repository": "git@github.com:gdfsdjj145/easy-ai.git",
   "type": "module",
   "scripts": {

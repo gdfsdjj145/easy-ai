@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
@@ -14,12 +15,17 @@ use tauri_plugin_updater::UpdaterExt;
 const DEFAULT_AGENT_BASE_URL: &str = "https://codecli.shop";
 const FALLBACK_AGENT_BASE_URL: &str = "http://66.253.42.202:3000/api";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+const CHAT_AGENT_TIMEOUT_SECS: u64 = 120;
+const MAX_PROMPT_FILE_CONTENT_CHARS: usize = 6_000;
+const MAX_PROMPT_HISTORY_ENTRIES: usize = 6;
+const MAX_PROMPT_HISTORY_TOTAL_CHARS: usize = 4_000;
 
 #[cfg(target_os = "windows")]
 fn codex_command() -> Command {
-  let mut cmd = Command::new("cmd");
-  cmd.arg("/C").arg("codex");
-  cmd
+  // npm 全局安装在 Windows 上的入口是 codex.cmd；直接调用，避免 `cmd /C` 重新解析参数
+  // 把带引号的 `-c base_url="..."` 吞掉，导致 codex 拿不到正确的 base_url 而回落到
+  // 用户配置（如 cc-switch 注入的代理），出现连接失败。
+  Command::new("codex.cmd")
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -628,21 +634,54 @@ fn build_chat_prompt(prompt: &str, context: &ChatContextPayload) -> String {
 
   if let Some(current_file_content) = &context.current_file_content {
     if !current_file_content.trim().is_empty() {
+      let compacted_content = truncate_for_prompt(current_file_content, MAX_PROMPT_FILE_CONTENT_CHARS);
       blocks.push(format!(
-        "当前文件内容如下：\n```text\n{current_file_content}\n```"
+        "当前文件内容如下：\n```text\n{compacted_content}\n```"
       ));
     }
   }
 
   if !context.conversation_history.is_empty() {
+    let compacted_history = compact_conversation_history(&context.conversation_history);
     blocks.push(format!(
       "最近对话：\n{}",
-      context.conversation_history.join("\n")
+      compacted_history
     ));
   }
 
   blocks.push(format!("用户问题：{prompt}"));
   blocks.join("\n\n")
+}
+
+fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
+  let total_chars = text.chars().count();
+  if total_chars <= max_chars {
+    return text.to_string();
+  }
+
+  let preview: String = text.chars().take(max_chars).collect();
+  format!("{preview}\n\n[内容已截断，共 {total_chars} 个字符。若需要完整内容，请结合当前文件路径继续读取。]")
+}
+
+fn compact_conversation_history(history: &[String]) -> String {
+  let start_index = history.len().saturating_sub(MAX_PROMPT_HISTORY_ENTRIES);
+  let mut selected: Vec<String> = history[start_index..].to_vec();
+  let mut joined = selected.join("\n");
+
+  while joined.chars().count() > MAX_PROMPT_HISTORY_TOTAL_CHARS && selected.len() > 1 {
+    selected.remove(0);
+    joined = selected.join("\n");
+  }
+
+  if joined.chars().count() > MAX_PROMPT_HISTORY_TOTAL_CHARS {
+    joined = truncate_for_prompt(&joined, MAX_PROMPT_HISTORY_TOTAL_CHARS);
+  }
+
+  if start_index > 0 {
+    format!("[仅保留最近 {} 条对话]\n{joined}", selected.len())
+  } else {
+    joined
+  }
 }
 
 fn agent_base_urls() -> [&'static str; 2] {
@@ -654,6 +693,8 @@ fn should_retry_with_fallback(error: &str) -> bool {
   [
     "stream disconnected before completion",
     "error sending request for url",
+    "reconnecting",
+    "retrying",
     "connection reset",
     "connection refused",
     "connection aborted",
@@ -665,9 +706,30 @@ fn should_retry_with_fallback(error: &str) -> bool {
     "broken pipe",
     "unexpected eof",
     "network",
+    "bad gateway",
+    "gateway",
+    "502",
+    "503",
+    "504",
   ]
   .iter()
   .any(|pattern| normalized.contains(pattern))
+}
+
+fn should_treat_stderr_as_status(text: &str) -> bool {
+  let normalized = text.to_lowercase();
+  normalized.contains("reconnecting") || normalized.contains("retrying")
+}
+
+fn normalize_status_log_text(text: &str) -> String {
+  let trimmed = text.trim();
+  if let Some(rest) = trimmed.strip_prefix("ERROR: ") {
+    rest.trim().to_string()
+  } else if let Some(rest) = trimmed.strip_prefix("WARN: ") {
+    rest.trim().to_string()
+  } else {
+    trimmed.to_string()
+  }
 }
 
 fn run_claude_chat(
@@ -685,7 +747,7 @@ fn run_claude_chat(
     prompt,
     workspace_path,
     api_key,
-    Duration::from_secs(45),
+    Duration::from_secs(CHAT_AGENT_TIMEOUT_SECS),
   )
 }
 
@@ -846,7 +908,7 @@ fn run_codex_chat(
     prompt,
     workspace_path,
     api_key,
-    Duration::from_secs(45),
+    Duration::from_secs(CHAT_AGENT_TIMEOUT_SECS),
   )
 }
 
@@ -1148,12 +1210,14 @@ fn run_command_with_timeout(
 
   let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
   let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+  let last_activity = Arc::new(Mutex::new(Instant::now()));
 
   let stdout_thread = child.stdout.take().map(|stdout_pipe| {
     let app = app.clone();
     let request_id = request_id.to_string();
     let agent_id = agent_id.to_string();
     let stdout_buffer = Arc::clone(&stdout_buffer);
+    let last_activity = Arc::clone(&last_activity);
 
     thread::spawn(move || {
       let mut reader = BufReader::new(stdout_pipe);
@@ -1169,6 +1233,9 @@ fn run_command_with_timeout(
         if let Ok(mut buffer) = stdout_buffer.lock() {
           buffer.extend_from_slice(line.as_bytes());
         }
+        if let Ok(mut activity) = last_activity.lock() {
+          *activity = Instant::now();
+        }
 
         if stream_stdout_logs {
           emit_agent_log(&app, &request_id, &agent_id, "stdout", line.trim_end());
@@ -1182,6 +1249,7 @@ fn run_command_with_timeout(
     let request_id = request_id.to_string();
     let agent_id = agent_id.to_string();
     let stderr_buffer = Arc::clone(&stderr_buffer);
+    let last_activity = Arc::clone(&last_activity);
 
     thread::spawn(move || {
       let mut reader = BufReader::new(stderr_pipe);
@@ -1197,13 +1265,26 @@ fn run_command_with_timeout(
         if let Ok(mut buffer) = stderr_buffer.lock() {
           buffer.extend_from_slice(line.as_bytes());
         }
+        if let Ok(mut activity) = last_activity.lock() {
+          *activity = Instant::now();
+        }
 
-        emit_agent_log(&app, &request_id, &agent_id, "stderr", line.trim_end());
+        let trimmed = line.trim_end();
+        let kind = if should_treat_stderr_as_status(trimmed) {
+          "status"
+        } else {
+          "stderr"
+        };
+        let text = if kind == "status" {
+          normalize_status_log_text(trimmed)
+        } else {
+          trimmed.to_string()
+        };
+        emit_agent_log(&app, &request_id, &agent_id, kind, &text);
       }
     })
   });
 
-  let start = SystemTime::now();
   loop {
     if let Some(status) = child.try_wait().map_err(|error| format!("{label} 状态检查失败：{error}"))? {
       if let Some(handle) = stdout_thread {
@@ -1219,11 +1300,11 @@ fn run_command_with_timeout(
       return Ok(std::process::Output { status, stdout, stderr });
     }
 
-    let elapsed = start.elapsed().unwrap_or_default();
+    let elapsed = last_activity.lock().map(|activity| activity.elapsed()).unwrap_or_default();
     if elapsed >= timeout {
       let _ = child.kill();
       let _ = child.wait();
-      return Err(format!("{label} 调用超时，请检查本机 CLI 是否可正常独立运行。"));
+      return Err(format!("{label} 调用空闲超时，请检查网络状态或本机 CLI 是否可正常独立运行。"));
     }
 
     thread::sleep(Duration::from_millis(100));
