@@ -25,6 +25,14 @@ if (!("scrollIntoView" in HTMLElement.prototype)) {
   });
 }
 
+if (!("scrollTo" in HTMLElement.prototype)) {
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+    writable: true,
+    configurable: true,
+    value: () => {},
+  });
+}
+
 vi.mock("react-pdf", () => ({
   pdfjs: {
     GlobalWorkerOptions: {

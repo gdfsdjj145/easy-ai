@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -32,18 +33,12 @@ import {
 } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import {
-  AssistantRuntimeProvider,
-  ComposerPrimitive,
-  MessagePrimitive,
-  ThreadPrimitive,
-  useLocalRuntime,
-} from "@assistant-ui/react";
 import { renderAsync as renderDocxAsync } from "docx-preview";
 import { LocalToolAgent } from "./lib/agent";
 import { BrowserFsAdapter } from "./lib/fs/browserFsAdapter";
 import { MockFsAdapter } from "./lib/fs/mockFsAdapter";
 import { TauriFsAdapter } from "./lib/fs/tauriFsAdapter";
+import { TaskTimeline } from "./components/TaskTimeline";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { Document, Page, pdfjs } from "react-pdf";
 import * as XLSX from "xlsx";
@@ -61,24 +56,22 @@ import {
   saveSessionState,
   type SessionState,
 } from "./lib/persistence";
+import { loadTaskStore, saveTaskStore } from "./lib/taskStore";
 import type {
-  Conversation,
-  ConversationMessage,
   AppUpdateInstallResult,
   AppUpdateStatus,
+  AgentRun,
+  AgentRunEventPayload,
   FileEntry,
   FileRecord,
   InstalledAgent,
   PendingWrite,
+  RunEvent,
+  TaskStoreSnapshot,
+  TaskThread,
+  TimelineMessage,
   Workspace,
 } from "./types";
-
-interface AgentLogItem {
-  requestId: string;
-  agentId: string;
-  kind: string;
-  text: string;
-}
 
 interface ExplorerContextMenuState {
   path: string;
@@ -113,6 +106,13 @@ const navigationItems = [
   { key: "settings", label: "Settings", sublabel: "设置", active: false, icon: <Settings2 className="h-4 w-4" /> },
 ];
 
+const LEFT_PANEL_DEFAULT_WIDTH = 292;
+const LEFT_PANEL_MIN_WIDTH = 240;
+const LEFT_PANEL_MAX_WIDTH = 420;
+const RIGHT_PANEL_DEFAULT_WIDTH = 420;
+const RIGHT_PANEL_MIN_WIDTH = 320;
+const RIGHT_PANEL_MAX_WIDTH = 560;
+
 function App() {
   const adapter = useMemo(
     () =>
@@ -125,18 +125,20 @@ function App() {
   );
   const agent = useMemo(() => new LocalToolAgent(adapter), [adapter]);
   const [session, setSession] = useState<SessionState>(() => loadSessionState());
+  const [taskStore, setTaskStore] = useState<TaskStoreSnapshot>(() => loadTaskStore());
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [currentFile, setCurrentFile] = useState<FileRecord | null>(null);
   const [previewContent, setPreviewContent] = useState("");
   const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false);
+  const [composerText, setComposerText] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [pendingWrite, setPendingWrite] = useState<PendingWrite | null>(null);
   const [isBusy, setIsBusy] = useState(false);
-  const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
-  const [rightCollapsed, setRightCollapsed] = useState(false);
-  const [leftWidth, setLeftWidth] = useState(292);
+  const [isFilePreviewOpen, setIsFilePreviewOpen] = useState(false);
+  const [leftWidth, setLeftWidth] = useState(LEFT_PANEL_DEFAULT_WIDTH);
+  const [rightWidth, setRightWidth] = useState(RIGHT_PANEL_DEFAULT_WIDTH);
   const [expandedFolders, setExpandedFolders] = useState<string[]>([]);
   const [selectedEntryPath, setSelectedEntryPath] = useState<string | null>(null);
   const [selectedEntryKind, setSelectedEntryKind] = useState<"file" | "directory" | null>(null);
@@ -154,9 +156,10 @@ function App() {
   const [isInstallingAppUpdate, setIsInstallingAppUpdate] = useState(false);
   const [installingAgentId, setInstallingAgentId] = useState<"claude" | "codex" | null>(null);
   const [testingAgentId, setTestingAgentId] = useState<"claude" | "codex" | null>(null);
-  const [currentRequestId, setCurrentRequestId] = useState<string | null>(null);
-  const [agentLogs, setAgentLogs] = useState<AgentLogItem[]>([]);
-  const dragWidthRef = useRef(leftWidth);
+  const panelWidthsRef = useRef({
+    left: LEFT_PANEL_DEFAULT_WIDTH,
+    right: RIGHT_PANEL_DEFAULT_WIDTH,
+  });
   const resizeFrameRef = useRef<number | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
   const currentFileRef = useRef<FileRecord | null>(null);
@@ -164,7 +167,6 @@ function App() {
   const installedAgentsRef = useRef<InstalledAgent[]>([]);
   const activeAgentIdRef = useRef<"claude" | "codex">("claude");
   const agentApiKeyRef = useRef(agentApiKey);
-  const agentRef = useRef(agent);
   const recentFilesRef = useRef(session.recentFiles);
   const suppressExplorerClickRef = useRef(false);
   const renameCommitRef = useRef(false);
@@ -172,6 +174,10 @@ function App() {
   useEffect(() => {
     saveSessionState(session);
   }, [session]);
+
+  useEffect(() => {
+    saveTaskStore(taskStore);
+  }, [taskStore]);
 
   useEffect(() => {
     const restore = async () => {
@@ -210,16 +216,11 @@ function App() {
         }
       }
 
-      if (!session.activeConversationId) {
-        const conversation = createConversation(restored.workspace.id);
-        setSession((previous) => ({
-          ...previous,
-          recentWorkspaces: [restored.workspace, ...previous.recentWorkspaces].slice(0, 5),
-          activeWorkspaceId: restored.workspace.id,
-          conversations: [conversation, ...previous.conversations].slice(0, 10),
-          activeConversationId: conversation.id,
-        }));
-      }
+      setSession((previous) => ({
+        ...previous,
+        recentWorkspaces: [restored.workspace, ...previous.recentWorkspaces].slice(0, 5),
+        activeWorkspaceId: restored.workspace.id,
+      }));
     };
 
     void restore();
@@ -229,33 +230,276 @@ function App() {
     ? entries.filter((entry) => entry.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : entries;
   const previewMeta = getPreviewMeta(currentFile, previewContent);
-  const breadcrumb = buildBreadcrumb(workspace, currentFile);
   const activeView = session.activeView ?? "workspace";
-  const desktopGrid = `${leftCollapsed ? "0px" : `${leftWidth}px`} minmax(0, 1fr) ${rightCollapsed ? "0px" : "344px"}`;
+  const isDesktopViewport = typeof window === "undefined" ? true : window.innerWidth >= 1024;
+  const desktopGrid = `${leftCollapsed ? "0px" : `${leftWidth}px`} minmax(0, 1fr) ${isFilePreviewOpen ? `${rightWidth}px` : "0px"}`;
   const explorerTree = useMemo(() => buildExplorerTree(visibleEntries), [visibleEntries]);
-  const visibleAgentLogs = useMemo(() => {
-    const filtered = agentLogs.filter((item) => item.requestId === currentRequestId && item.text.trim());
-    const compacted: AgentLogItem[] = [];
+  const workspaceTasks = useMemo(
+    () => taskStore.tasks.filter((task) => task.workspaceId === workspace?.id),
+    [taskStore.tasks, workspace?.id],
+  );
+  const activeTask = useMemo(
+    () =>
+      workspaceTasks.find((task) => task.id === session.activeTaskId) ??
+      workspaceTasks[workspaceTasks.length - 1] ??
+      null,
+    [session.activeTaskId, workspaceTasks],
+  );
+  const activeTaskRuns = useMemo(
+    () => taskStore.runs.filter((run) => run.taskId === activeTask?.id),
+    [activeTask?.id, taskStore.runs],
+  );
+  const activeTaskMessages = useMemo(
+    () => taskStore.messages.filter((message) => message.taskId === activeTask?.id),
+    [activeTask?.id, taskStore.messages],
+  );
+  const activeTaskRunEvents = useMemo(
+    () => taskStore.runEvents.filter((event) => event.taskId === activeTask?.id),
+    [activeTask?.id, taskStore.runEvents],
+  );
+  const activeRun = useMemo(
+    () =>
+      [...activeTaskRuns]
+        .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+        .find((run) => run.status === "running") ??
+      [...activeTaskRuns].sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())[0] ??
+      null,
+    [activeTaskRuns],
+  );
+  const isAgentRunning = activeRun?.status === "running";
+  const currentConversationTitle = activeTask?.title.trim() || workspace?.name || "新会话";
 
-    for (const item of filtered) {
-      const previous = compacted[compacted.length - 1];
-      if (previous && previous.kind === item.kind && previous.text === item.text) {
-        continue;
-      }
+  function createTaskThreadRecord(workspaceId: string, title = "新会话"): TaskThread {
+    const now = new Date().toISOString();
+    return {
+      id: createId("task"),
+      workspaceId,
+      title,
+      createdAt: now,
+      updatedAt: now,
+      status: "idle",
+    };
+  }
 
-      if (
-        previous &&
-        ((previous.kind === "stderr" && item.kind === "stdout") || (previous.kind === "stdout" && item.kind === "stderr")) &&
-        previous.text === item.text
-      ) {
-        continue;
-      }
+  function createRunRecord(taskId: string, prompt: string, agentId: AgentRun["agentId"]): AgentRun {
+    return {
+      id: createId("run"),
+      taskId,
+      agentId,
+      prompt,
+      status: "running",
+      startedAt: new Date().toISOString(),
+    };
+  }
 
-      compacted.push(item);
+  function createTimelineEntry(
+    taskId: string,
+    role: TimelineMessage["role"],
+    kind: TimelineMessage["kind"],
+    content: string,
+    runId?: string,
+  ): TimelineMessage {
+    return {
+      id: createId("timeline"),
+      taskId,
+      runId,
+      role,
+      kind,
+      content,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  function ensureActiveTaskRecord(workspaceRecord: Workspace | null) {
+    if (!workspaceRecord) {
+      return null;
     }
 
-    return compacted.slice(-12);
-  }, [agentLogs, currentRequestId]);
+    const existing =
+      taskStore.tasks.find((task) => task.id === session.activeTaskId && task.workspaceId === workspaceRecord.id) ??
+      [...taskStore.tasks].reverse().find((task) => task.workspaceId === workspaceRecord.id) ??
+      null;
+
+    if (existing) {
+      if (session.activeTaskId !== existing.id) {
+        setSession((previous) => ({
+          ...previous,
+          activeTaskId: existing.id,
+        }));
+      }
+      return existing;
+    }
+
+    const nextTask = createTaskThreadRecord(workspaceRecord.id);
+    setTaskStore((previous) => ({
+      ...previous,
+      tasks: [...previous.tasks, nextTask],
+    }));
+    setSession((previous) => ({
+      ...previous,
+      activeTaskId: nextTask.id,
+    }));
+    return nextTask;
+  }
+
+  function buildTaskConversationHistory(taskId: string) {
+    return taskStore.messages
+      .filter((message) => message.taskId === taskId && (message.kind === "prompt" || message.kind === "final"))
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      .map((message) => `${message.role === "assistant" ? "助手" : "用户"}：${message.content}`);
+  }
+
+  const applyRunEvent = useCallback((event: AgentRunEventPayload) => {
+    const eventAt = new Date(event.at).toISOString();
+    setTaskStore((previous) => {
+      const nextRuns = previous.runs.map((run) => {
+        if (run.id !== event.runId) {
+          return run;
+        }
+
+        if (event.type === "run.error") {
+          return {
+            ...run,
+            status: "error",
+            finishedAt: eventAt,
+          };
+        }
+
+        if (event.type === "run.done") {
+          return {
+            ...run,
+            status: run.status === "error" ? "error" : "done",
+            finishedAt: eventAt,
+          };
+        }
+
+        return run;
+      });
+
+      const nextTasks = previous.tasks.map((task) => {
+        if (task.id !== event.taskId) {
+          return task;
+        }
+
+        if (event.type === "run.error") {
+          return {
+            ...task,
+            status: "error",
+            updatedAt: eventAt,
+          };
+        }
+
+        if (event.type === "run.done") {
+          return {
+            ...task,
+            status: "idle",
+            updatedAt: eventAt,
+          };
+        }
+
+        if (event.type === "run.started" || event.type === "run.log" || event.type === "run.final" || event.type === "run.pending_write") {
+          return {
+            ...task,
+            status: "running",
+            updatedAt: eventAt,
+          };
+        }
+
+        return task;
+      });
+
+      const nextMessages = [...previous.messages];
+      const nextRunEvents = [...previous.runEvents];
+
+      if (event.type === "run.log" && event.text) {
+        nextRunEvents.push({
+          id: createId("event"),
+          taskId: event.taskId,
+          runId: event.runId,
+          seq: event.seq ?? nextRunEvents.filter((item) => item.runId === event.runId).length,
+          type: event.level ?? "status",
+          text: event.text,
+          createdAt: eventAt,
+        });
+      }
+
+      if (event.type === "run.final" && event.content) {
+        nextRunEvents.push({
+          id: createId("event"),
+          taskId: event.taskId,
+          runId: event.runId,
+          seq: event.seq ?? nextRunEvents.filter((item) => item.runId === event.runId).length,
+          type: "final",
+          content: event.content,
+          createdAt: eventAt,
+        });
+        nextMessages.push({
+          id: createId("timeline"),
+          taskId: event.taskId,
+          runId: event.runId,
+          role: "assistant",
+          kind: "final",
+          content: event.content,
+          createdAt: eventAt,
+        });
+      }
+
+      if (event.type === "run.pending_write") {
+        nextRunEvents.push({
+          id: createId("event"),
+          taskId: event.taskId,
+          runId: event.runId,
+          seq: event.seq ?? nextRunEvents.filter((item) => item.runId === event.runId).length,
+          type: "pending_write",
+          path: event.path,
+          reason: event.reason,
+          content: event.content,
+          createdAt: eventAt,
+        });
+      }
+
+      if (event.type === "run.error" && event.text) {
+        nextRunEvents.push({
+          id: createId("event"),
+          taskId: event.taskId,
+          runId: event.runId,
+          seq: event.seq ?? nextRunEvents.filter((item) => item.runId === event.runId).length,
+          type: "error",
+          text: event.text,
+          createdAt: eventAt,
+        });
+        nextMessages.push({
+          id: createId("timeline"),
+          taskId: event.taskId,
+          runId: event.runId,
+          role: "system",
+          kind: "error",
+          content: event.text,
+          createdAt: eventAt,
+        });
+      }
+
+      if (event.type === "run.done") {
+        nextRunEvents.push({
+          id: createId("event"),
+          taskId: event.taskId,
+          runId: event.runId,
+          seq: event.seq ?? nextRunEvents.filter((item) => item.runId === event.runId).length,
+          type: "done",
+          createdAt: eventAt,
+        });
+      }
+
+      return {
+        ...previous,
+        tasks: nextTasks,
+        runs: nextRuns,
+        messages: nextMessages,
+        runEvents: nextRunEvents,
+      };
+    });
+  }, []);
+
   async function refreshInstalledAgents(preferredAgentId?: "claude" | "codex") {
     if (!isTauriApp) {
       setInstalledAgents([]);
@@ -275,79 +519,6 @@ function App() {
       setInstalledAgents([]);
     }
   }
-
-  const chatAdapter: Parameters<typeof useLocalRuntime>[0] = useMemo(
-    () => ({
-      async run({ messages }) {
-        setIsAgentRunning(true);
-        const latestPrompt = extractLatestUserText(messages);
-        const conversationHistory = buildConversationHistory(messages);
-        const activeCliAgent = installedAgentsRef.current.find(
-          (item) => item.id === activeAgentIdRef.current && item.available,
-        );
-
-        if (isTauriApp && workspaceRef.current && activeCliAgent) {
-          try {
-            const requestId = createId("agent");
-            setCurrentRequestId(requestId);
-            setAgentLogs([]);
-            const assistantMessage = await invoke<string>("run_agent_chat", {
-              agentId: activeCliAgent.id,
-              prompt: latestPrompt,
-              apiKey: agentApiKeyRef.current,
-              requestId,
-              context: {
-                workspacePath: workspaceRef.current.path,
-                currentFilePath: currentFileRef.current?.path ?? null,
-                currentFileContent: previewContentRef.current || null,
-                conversationHistory,
-              },
-            });
-
-            return {
-              content: [{ type: "text", text: assistantMessage }],
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `调用 ${activeCliAgent.label} 失败：${String(error)}` }],
-            };
-          } finally {
-            setIsAgentRunning(false);
-          }
-        }
-
-        try {
-          const result = await agentRef.current.run(latestPrompt, {
-            currentFile: currentFileRef.current,
-            currentContent: previewContentRef.current,
-            recentFiles: recentFilesRef.current,
-          });
-
-          if (result.currentFile) {
-            setCurrentFile(result.currentFile);
-          }
-          if (result.previewContent !== undefined) {
-            setPreviewContent(result.previewContent);
-          }
-          if (result.pendingWrite) {
-            setPendingWrite(result.pendingWrite);
-          }
-
-          return {
-            content: [{ type: "text", text: result.assistantMessage }],
-          };
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `处理请求失败：${String(error)}` }],
-          };
-        } finally {
-          setIsAgentRunning(false);
-        }
-      },
-    }),
-    [],
-  );
-  const chatRuntime = useLocalRuntime(chatAdapter);
 
   useEffect(() => {
     const topLevelDirectories = entries
@@ -372,12 +543,11 @@ function App() {
   }, [currentFile?.path]);
 
   useEffect(() => {
-    dragWidthRef.current = leftWidth;
-  }, [leftWidth]);
-
-  useEffect(() => {
-    agentRef.current = agent;
-  }, [agent]);
+    panelWidthsRef.current = {
+      left: leftWidth,
+      right: rightWidth,
+    };
+  }, [leftWidth, rightWidth]);
 
   useEffect(() => {
     recentFilesRef.current = session.recentFiles;
@@ -444,18 +614,34 @@ function App() {
       return;
     }
 
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
 
-    void listen<AgentLogItem>("agent-log", (event) => {
-      setAgentLogs((previous) => [...previous, event.payload]);
+    void listen<AgentRunEventPayload>("agent-run-event", (event) => {
+      const payload = event.payload;
+
+      if (payload.type === "run.pending_write" && payload.path && payload.reason && payload.content) {
+        setPendingWrite({
+          path: payload.path,
+          reason: payload.reason,
+          content: payload.content,
+        });
+      }
+
+      applyRunEvent(payload);
     }).then((dispose) => {
-      unlisten = dispose;
+      if (cancelled) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
     });
 
     return () => {
+      cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [applyRunEvent]);
 
   useEffect(() => {
     if (!isTauriApp || session.activeView !== "settings" || appUpdateStatus || isCheckingAppUpdate) {
@@ -465,8 +651,29 @@ function App() {
     void handleCheckAppUpdate(true);
   }, [session.activeView, appUpdateStatus, isCheckingAppUpdate]);
 
-  function queueLeftWidth(nextWidth: number) {
-    dragWidthRef.current = Math.min(420, Math.max(240, nextWidth));
+  useEffect(() => {
+    if (!workspace) {
+      return;
+    }
+
+    void Promise.resolve().then(() => {
+      ensureActiveTaskRecord(workspace);
+    });
+  }, [workspace?.id]);
+
+  function clampPanelWidth(side: "left" | "right", nextWidth: number) {
+    if (side === "left") {
+      return Math.min(LEFT_PANEL_MAX_WIDTH, Math.max(LEFT_PANEL_MIN_WIDTH, nextWidth));
+    }
+
+    return Math.min(RIGHT_PANEL_MAX_WIDTH, Math.max(RIGHT_PANEL_MIN_WIDTH, nextWidth));
+  }
+
+  function queuePanelWidth(side: "left" | "right", nextWidth: number) {
+    panelWidthsRef.current = {
+      ...panelWidthsRef.current,
+      [side]: clampPanelWidth(side, nextWidth),
+    };
 
     if (resizeFrameRef.current !== null) {
       return;
@@ -474,7 +681,8 @@ function App() {
 
     resizeFrameRef.current = window.requestAnimationFrame(() => {
       resizeFrameRef.current = null;
-      setLeftWidth(dragWidthRef.current);
+      setLeftWidth(panelWidthsRef.current.left);
+      setRightWidth(panelWidthsRef.current.right);
     });
   }
 
@@ -482,7 +690,7 @@ function App() {
     event.preventDefault();
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      queueLeftWidth(moveEvent.clientX);
+      queuePanelWidth("left", moveEvent.clientX);
     };
 
     const handlePointerUp = () => {
@@ -490,7 +698,28 @@ function App() {
       document.body.style.userSelect = "";
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
-      setLeftWidth(dragWidthRef.current);
+      setLeftWidth(panelWidthsRef.current.left);
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp, { once: true });
+  }
+
+  function startRightResize(event: ReactPointerEvent<HTMLButtonElement>) {
+    event.preventDefault();
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      queuePanelWidth("right", window.innerWidth - moveEvent.clientX);
+    };
+
+    const handlePointerUp = () => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      setRightWidth(panelWidthsRef.current.right);
     };
 
     document.body.style.cursor = "col-resize";
@@ -504,11 +733,11 @@ function App() {
     try {
       const selection = await adapter.pickWorkspace();
       const items = await adapter.listDir();
-      const conversation = createConversation(selection.workspace.id);
       setWorkspace(selection.workspace);
       setEntries(items);
       setCurrentFile(null);
       setPreviewContent("");
+      setIsFilePreviewOpen(false);
       setSession((previous) => ({
         ...previous,
         recentWorkspaces: [
@@ -516,11 +745,7 @@ function App() {
           ...previous.recentWorkspaces.filter((item) => item.name !== selection.workspace.name),
         ].slice(0, 5),
         activeWorkspaceId: selection.workspace.id,
-        conversations: [
-          conversation,
-          ...previous.conversations.filter((item) => item.workspaceId !== selection.workspace.id),
-        ].slice(0, 10),
-        activeConversationId: conversation.id,
+        activeTaskId: null,
         currentFilePath: null,
         recentFiles: [],
       }));
@@ -538,6 +763,7 @@ function App() {
     setContextMenu(null);
     setRenamingEntry(null);
     setCreatingEntry(null);
+    setIsFilePreviewOpen(true);
     setSession((previous) => ({
       ...previous,
       currentFilePath: file.path,
@@ -772,6 +998,187 @@ function App() {
     setSelectedEntryKind(null);
   }
 
+  async function handleSubmitPrompt(rawPrompt: string) {
+    const prompt = rawPrompt.trim();
+    if (!prompt || isAgentRunning) {
+      return;
+    }
+
+    const workspaceRecord = workspaceRef.current;
+    const task = ensureActiveTaskRecord(workspaceRecord);
+    if (!task) {
+      return;
+    }
+
+    const conversationHistory = buildTaskConversationHistory(task.id);
+    const selectedAgent =
+      installedAgentsRef.current.find((item) => item.id === activeAgentIdRef.current && item.available) ?? null;
+    const run = createRunRecord(task.id, prompt, isTauriApp ? selectedAgent?.id ?? activeAgentIdRef.current : "local");
+    const promptMessage = createTimelineEntry(task.id, "user", "prompt", prompt, run.id);
+    const nextTaskTitle = task.title === "新会话" ? prompt.slice(0, 48) : task.title;
+
+    setTaskStore((previous) => ({
+      ...previous,
+      tasks: previous.tasks.map((item) =>
+        item.id === task.id
+          ? {
+              ...item,
+              title: nextTaskTitle,
+              status: "running",
+              updatedAt: run.startedAt,
+            }
+          : item,
+      ),
+      runs: [...previous.runs, run],
+      messages: [...previous.messages, promptMessage],
+    }));
+    setSession((previous) => ({
+      ...previous,
+      activeTaskId: task.id,
+    }));
+    setComposerText("");
+
+    if (isTauriApp && workspaceRecord && selectedAgent) {
+      try {
+        await invoke<void>("start_agent_run", {
+          agentId: selectedAgent.id,
+          prompt,
+          apiKey: agentApiKeyRef.current,
+          runId: run.id,
+          taskId: task.id,
+          context: {
+            workspacePath: workspaceRecord.path,
+            currentFilePath: currentFileRef.current?.path ?? null,
+            currentFileContent: previewContentRef.current || null,
+            conversationHistory,
+          },
+        });
+      } catch (error) {
+        const now = Date.now();
+        applyRunEvent({
+          type: "run.error",
+          taskId: task.id,
+          runId: run.id,
+          text: `调用 ${selectedAgent.label} 失败：${String(error)}`,
+          at: now,
+        });
+        applyRunEvent({
+          type: "run.done",
+          taskId: task.id,
+          runId: run.id,
+          at: now,
+        });
+      }
+      return;
+    }
+
+    if (isTauriApp && !selectedAgent) {
+      const now = Date.now();
+      applyRunEvent({
+        type: "run.error",
+        taskId: task.id,
+        runId: run.id,
+        text: "当前未检测到可用的 Claude Code 或 Codex CLI。",
+        at: now,
+      });
+      applyRunEvent({
+        type: "run.done",
+        taskId: task.id,
+        runId: run.id,
+        at: now,
+      });
+      return;
+    }
+
+    const now = Date.now();
+    applyRunEvent({
+      type: "run.started",
+      taskId: task.id,
+      runId: run.id,
+      agentId: "local",
+      prompt,
+      at: now,
+    });
+    applyRunEvent({
+      type: "run.log",
+      taskId: task.id,
+      runId: run.id,
+      level: "status",
+      text: "启动本地 Agent",
+      seq: 0,
+      at: now,
+    });
+
+    try {
+      const result = await agent.run(prompt, {
+        currentFile: currentFileRef.current,
+        currentContent: previewContentRef.current,
+        recentFiles: recentFilesRef.current,
+      });
+
+      if (result.currentFile) {
+        setCurrentFile(result.currentFile);
+      }
+      if (result.previewContent !== undefined) {
+        setPreviewContent(result.previewContent);
+      }
+
+      result.fileActions.forEach((action, index) => {
+        applyRunEvent({
+          type: "run.log",
+          taskId: task.id,
+          runId: run.id,
+          level: "status",
+          text: `${action.type.toUpperCase()} ${action.path}`,
+          seq: index + 1,
+          at: Date.now(),
+        });
+      });
+
+      if (result.pendingWrite) {
+        setPendingWrite(result.pendingWrite);
+        applyRunEvent({
+          type: "run.pending_write",
+          taskId: task.id,
+          runId: run.id,
+          path: result.pendingWrite.path,
+          reason: result.pendingWrite.reason,
+          content: result.pendingWrite.content,
+          at: Date.now(),
+        });
+      }
+
+      applyRunEvent({
+        type: "run.final",
+        taskId: task.id,
+        runId: run.id,
+        content: result.assistantMessage,
+        at: Date.now(),
+      });
+      applyRunEvent({
+        type: "run.done",
+        taskId: task.id,
+        runId: run.id,
+        at: Date.now(),
+      });
+    } catch (error) {
+      const failureAt = Date.now();
+      applyRunEvent({
+        type: "run.error",
+        taskId: task.id,
+        runId: run.id,
+        text: `处理请求失败：${String(error)}`,
+        at: failureAt,
+      });
+      applyRunEvent({
+        type: "run.done",
+        taskId: task.id,
+        runId: run.id,
+        at: failureAt,
+      });
+    }
+  }
+
   async function handleCheckAppUpdate(silent = false) {
     if (!isTauriApp) {
       setUpdateMessage("自动更新仅支持桌面端 Tauri 应用。");
@@ -842,7 +1249,15 @@ function App() {
       setPreviewContent(write.content);
     }
     setPendingWrite(null);
-    appendMessage(createMessage("assistant", `写入完成：${write.path}`, "info"));
+    if (activeTask) {
+      setTaskStore((previous) => ({
+        ...previous,
+        messages: [
+          ...previous.messages,
+          createTimelineEntry(activeTask.id, "system", "info", `写入完成：${write.path}`),
+        ],
+      }));
+    }
   }
 
   function cancelWrite() {
@@ -850,38 +1265,16 @@ function App() {
       return;
     }
 
-    appendMessage(createMessage("assistant", `已取消写入：${pendingWrite.path}`, "info"));
-    setPendingWrite(null);
-  }
-
-  function appendMessage(message: ConversationMessage) {
-    setSession((previous) => {
-      const targetId = previous.activeConversationId ?? createConversation(previous.activeWorkspaceId ?? "standalone").id;
-      const existing = previous.conversations.find((conversation) => conversation.id === targetId);
-      const nextConversation = existing
-        ? {
-            ...existing,
-            messages: [...existing.messages, message],
-            updatedAt: message.timestamp,
-            summary: summarizeConversation([...existing.messages, message]),
-          }
-        : {
-            id: targetId,
-            workspaceId: previous.activeWorkspaceId ?? "standalone",
-            summary: summarizeConversation([message]),
-            updatedAt: message.timestamp,
-            messages: [message],
-          };
-
-      return {
+    if (activeTask) {
+      setTaskStore((previous) => ({
         ...previous,
-        conversations: [
-          nextConversation,
-          ...previous.conversations.filter((conversation) => conversation.id !== targetId),
+        messages: [
+          ...previous.messages,
+          createTimelineEntry(activeTask.id, "system", "info", `已取消写入：${pendingWrite.path}`),
         ],
-        activeConversationId: targetId,
-      };
-    });
+      }));
+    }
+    setPendingWrite(null);
   }
 
   return (
@@ -970,39 +1363,44 @@ function App() {
             {!leftCollapsed ? <LeftResizeHandle onResizeStart={startLeftResize} /> : null}
           </section>
 
-          <AssistantRuntimeProvider runtime={chatRuntime}>
-            <section className="min-h-[780px] rounded-[24px] border border-white/70 bg-white/92 p-3 shadow-[0_20px_60px_rgba(34,34,34,0.07)] backdrop-blur md:p-4 lg:h-screen lg:min-h-0 lg:overflow-hidden lg:rounded-none lg:border-0 lg:bg-white lg:p-0 lg:shadow-none">
-              <div className="relative flex h-full min-h-[780px] flex-col rounded-[20px] border border-[#efebe4] bg-[#fdfcf9] lg:min-h-0 lg:rounded-none lg:border-0 lg:bg-white">
-                <div className="flex items-center justify-between border-b border-[#ece7df] px-5 py-4 md:px-7 md:py-5 lg:px-8 lg:pt-6">
-                  <div className="flex min-w-0 items-center gap-3">
+          <section className="min-h-[780px] rounded-[24px] border border-white/70 bg-white/92 p-3 shadow-[0_20px_60px_rgba(34,34,34,0.07)] backdrop-blur md:p-4 lg:h-screen lg:min-h-0 lg:overflow-hidden lg:rounded-none lg:border-0 lg:bg-white lg:p-0 lg:shadow-none">
+            <div className="relative flex h-full min-h-[780px] flex-col rounded-[20px] border border-[#efebe4] bg-[#fdfcf9] lg:min-h-0 lg:rounded-none lg:border-0 lg:bg-white">
+              <div className="flex items-center justify-between border-b border-[#ece7df] px-5 py-4 md:px-7 md:py-5 lg:px-8 lg:pt-6">
+                <div className="flex min-w-0 items-center gap-3">
                   <HeaderToggleButton
                     icon={leftCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
                     label={leftCollapsed ? "显示左栏" : "隐藏左栏"}
                     onClick={() => setLeftCollapsed((value) => !value)}
                   />
-                  <div className="flex min-w-0 flex-wrap items-center gap-1 text-[14px] text-[#9c968d]">
-                    {breadcrumb.map((part, index) => (
-                      <span key={`${part}-${index}`} className="inline-flex items-center gap-1.5">
-                        {index > 0 ? <ChevronRight className="h-3.5 w-3.5 text-[#c4bfb6]" /> : null}
-                        <span>{part}</span>
-                      </span>
-                    ))}
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#9b9388]">Timeline</p>
+                    <p className="truncate text-[15px] font-semibold text-[#2b2a28] md:text-[16px]">
+                      {currentConversationTitle}
+                    </p>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="hidden text-xs text-[#98938b] lg:inline">
-                    {currentFile ? `${currentFile.extension.toUpperCase() || "TXT"} Preview` : workspace ? workspace.name : "当前文档"}
-                  </span>
                   <HeaderToggleButton
-                    icon={rightCollapsed ? <PanelRightOpen className="h-4 w-4" /> : <PanelRightClose className="h-4 w-4" />}
-                    label={rightCollapsed ? "显示助手" : "隐藏助手"}
-                    onClick={() => setRightCollapsed((value) => !value)}
+                    icon={<Settings2 className="h-4 w-4" />}
+                    label="设置"
+                    onClick={() =>
+                      setSession((previous) => ({
+                        ...previous,
+                        activeView: previous.activeView === "settings" ? "workspace" : "settings",
+                      }))
+                    }
+                  />
+                  <HeaderToggleButton
+                    icon={isFilePreviewOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+                    label={isFilePreviewOpen ? "隐藏文件" : "显示文件"}
+                    onClick={() => setIsFilePreviewOpen((value) => !value)}
+                    disabled={!currentFile}
                   />
                   <span className="rounded-full bg-[#eceae6] px-4 py-1 text-[11px] font-bold uppercase tracking-[0.18em] text-[#8f8a83]">
-                    {pendingWrite ? "PENDING" : isAgentRunning ? "RUNNING" : "READING"}
+                    {pendingWrite ? "PENDING" : isAgentRunning ? "RUNNING" : "READY"}
                   </span>
-                  </div>
                 </div>
+              </div>
 
               {activeView === "settings" ? (
                 <SettingsView
@@ -1064,189 +1462,115 @@ function App() {
                   }}
                 />
               ) : (
-              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                <div className="min-h-0 flex-1 overflow-y-auto px-5 py-8 pb-[168px] md:px-8 md:py-10 md:pb-[178px] lg:px-10 lg:py-14 lg:pb-[190px]">
-                {currentFile ? (
-                  <article className="mx-auto max-w-3xl text-[#2c2c2b]">
-                    <h1 className="font-sans text-[42px] font-bold leading-[1.08] tracking-[-0.04em] text-[#222221] md:text-[54px]">
-                      {previewMeta.title}
-                    </h1>
-                    {previewMeta.lead ? (
-                      <p className="mt-6 max-w-2xl text-[16px] leading-8 text-[#4d4b47] md:text-[17px]">
-                        {previewMeta.lead}
-                      </p>
-                    ) : null}
-                    <div className="mt-8 flex flex-wrap items-center gap-3 text-[12px] font-medium uppercase tracking-[0.16em] text-[#9b9388]">
-                      <span>{currentFile.path}</span>
-                      <span>{currentFile.extension.toUpperCase() || "FILE"}</span>
-                      {isTextPreviewFileRecord(currentFile) ? (
-                        <span>{previewContent ? previewContent.split(/\r?\n/).length : 0} Lines</span>
-                      ) : null}
-                      {isTextPreviewFileRecord(currentFile) ? (
-                        <span>{previewContent.trim() ? previewContent.trim().split(/\s+/).length : 0} Words</span>
-                      ) : null}
+                <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                  <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 md:px-8 md:py-6 lg:px-10 lg:py-8">
+                    <TaskTimeline
+                      task={activeTask}
+                      runs={activeTaskRuns}
+                      messages={activeTaskMessages}
+                      runEvents={activeTaskRunEvents}
+                      pendingWrite={pendingWrite}
+                      onConfirmWrite={() => void confirmWrite()}
+                      onCancelWrite={cancelWrite}
+                    />
+                  </div>
+
+                  <div className="shrink-0 border-t border-[#ece7df] bg-white px-5 py-4 md:px-8 md:py-5 lg:px-10 lg:py-6">
+                    <div className="mx-auto max-w-4xl">
+                      <div className="rounded-[24px] border border-[#e7dfd3] bg-[#fbfaf7] p-2.5 shadow-[0_12px_28px_rgba(28,28,28,0.06)]">
+                        <textarea
+                          placeholder="输入提示开始对话，或处理当前工作区……"
+                          disabled={isAgentRunning}
+                          rows={2}
+                          value={composerText}
+                          onChange={(event) => setComposerText(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && !event.shiftKey) {
+                              event.preventDefault();
+                              void handleSubmitPrompt(composerText);
+                            }
+                          }}
+                          className="h-16 min-h-16 max-h-32 w-full resize-none overflow-y-auto border-none bg-transparent px-2 py-1.5 text-[15px] leading-7 text-[#3d3c3a] outline-none placeholder:text-[#bbb5ac]"
+                        />
+                        <div className="mt-1.5 flex items-center justify-end">
+                          <button
+                            type="button"
+                            disabled={isAgentRunning || !composerText.trim()}
+                            onClick={() => void handleSubmitPrompt(composerText)}
+                            className="inline-flex min-w-[132px] items-center justify-center rounded-[16px] bg-[#1f1f1f] px-4 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {isAgentRunning ? "运行中…" : "发送"}
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                    <div className="mt-10 space-y-8">
-                      <FilePreview
+                  </div>
+
+                  {!isDesktopViewport && isFilePreviewOpen && currentFile ? (
+                    <div className="border-t border-[#ece7df] bg-[#fbfaf7] px-5 py-5 lg:hidden">
+                      <div className="mb-4 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-[16px] font-semibold text-[#2b2a28]">{previewMeta.title}</p>
+                          <p className="mt-1 truncate text-[12px] text-[#98938b]">{currentFile.path}</p>
+                        </div>
+                        <HeaderToggleButton
+                          icon={<X className="h-4 w-4" />}
+                          label="关闭文件预览"
+                          onClick={() => setIsFilePreviewOpen(false)}
+                        />
+                      </div>
+                      <FilePreviewPanelBody
                         file={currentFile}
-                        content={previewContent}
+                        previewMeta={previewMeta}
+                        previewContent={previewContent}
                         onOpenImage={() => setIsImagePreviewOpen(true)}
                       />
                     </div>
-                  </article>
-                ) : (
-                  <div className="flex h-full min-h-[520px] flex-col items-center justify-center rounded-[24px] border border-dashed border-[#e2ddd5] bg-white/70 text-center">
-                    <Sparkles className="h-10 w-10 text-[#d3a31f]" />
-                    <p className="mt-5 text-[32px] font-semibold tracking-[-0.03em] text-[#2a2a29]">
-                      选择左侧文档开始浏览
-                    </p>
-                    <p className="mt-3 max-w-lg text-[15px] leading-7 text-[#8b857e]">
-                      中间区域现在只负责展示 Markdown 内容。AI 输入区域放在下方，专门用于提问、总结和生成文档。
-                    </p>
-                  </div>
-                )}
-                </div>
-
-                <div
-                  className={cn(
-                    "pointer-events-none absolute inset-x-0 bottom-0 z-10 px-5 pb-4 pt-5 transition-all duration-300 md:px-8 md:pb-5 md:pt-6 lg:px-10 lg:pb-6",
-                    rightCollapsed && "translate-y-8 opacity-0",
-                  )}
-                >
-                  <div className="relative mx-auto max-w-3xl">
-                    <ComposerPrimitive.Root className="pointer-events-auto rounded-[24px] border border-[#e7dfd3] bg-[#fbfaf7] p-2.5 shadow-[0_12px_28px_rgba(28,28,28,0.06)]">
-                      <ComposerPrimitive.Input
-                        placeholder="输入提示信息以处理当前文档……"
-                        disabled={isAgentRunning}
-                        rows={2}
-                        className="h-16 min-h-16 max-h-16 w-full resize-none overflow-y-auto border-none bg-transparent px-2 py-1.5 text-[15px] leading-7 text-[#3d3c3a] outline-none placeholder:text-[#bbb5ac]"
-                      />
-                      <div className="mt-1.5 flex items-center justify-end">
-                        <ComposerPrimitive.Send
-                          disabled={isAgentRunning}
-                          className="inline-flex min-w-[132px] items-center justify-center rounded-[16px] bg-[#1f1f1f] px-4 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:opacity-50"
-                        >
-                          {isAgentRunning ? "发送中…" : "发送"}
-                        </ComposerPrimitive.Send>
-                      </div>
-                    </ComposerPrimitive.Root>
-                  </div>
-                </div>
-              </div>
-              )}
-              </div>
-            </section>
-
-            <section
-              className={cn(
-                "hidden h-screen flex-col overflow-hidden border-l border-[#e7e3dc] bg-[#fbfaf7] transition-all duration-300 lg:flex",
-                rightCollapsed ? "pointer-events-none border-l-0 opacity-0" : "opacity-100",
-              )}
-            >
-              <div className="flex items-center justify-between border-b border-[#f1ece5] px-4 py-3">
-                <div className="min-w-0">
-                  <p className="text-[13px] font-semibold uppercase tracking-[0.18em] text-[#8f8a83]">Conversation</p>
-                </div>
-                <HeaderToggleButton
-                  icon={<Settings2 className="h-4 w-4" />}
-                  label="设置"
-                  onClick={() =>
-                    setSession((previous) => ({
-                      ...previous,
-                      activeView: previous.activeView === "settings" ? "workspace" : "settings",
-                    }))
-                  }
-                />
-              </div>
-
-              <ThreadPrimitive.Root className="min-h-0 flex-1">
-                <ThreadPrimitive.Viewport className="h-full overflow-y-auto px-5 py-5">
-                  {visibleAgentLogs.length > 0 ? (
-                    <div className="mb-3 rounded-[14px] border border-[#ece6dc] bg-[#fbfaf7] px-3 py-2.5">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#9b9388]">Activity</p>
-                        <span className="text-[10px] text-[#b2aba1]">{visibleAgentLogs.length} 条</span>
-                      </div>
-                      <div className="mt-2 max-h-36 space-y-1 overflow-y-auto pr-1">
-                        {visibleAgentLogs.map((log, index) => (
-                          <div key={`${log.requestId}-${index}`} className="text-[11px] leading-4.5 text-[#7c756d]">
-                            <span
-                              className={cn(
-                                "mr-1.5 inline-block rounded px-1.5 py-0.5 text-[9px] uppercase tracking-[0.1em]",
-                                log.kind === "status" && "bg-[#f1ebe2] text-[#9a948b]",
-                                log.kind === "stdout" && "bg-[#e8efe6] text-[#6d8b68]",
-                                log.kind === "stderr" && "bg-[#f4e7e3] text-[#b16e5b]",
-                                log.kind === "error" && "bg-[#f3dedd] text-[#b75656]",
-                              )}
-                            >
-                              {log.kind === "status"
-                                ? "状态"
-                                : log.kind === "stdout"
-                                  ? "输出"
-                                  : log.kind === "stderr"
-                                    ? "日志"
-                                    : "错误"}
-                            </span>
-                            <span>{log.text}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
                   ) : null}
-                  <ThreadPrimitive.If empty>
-                    <div className="px-1 py-4 text-sm leading-6 text-[#8f8a83]">
-                      当前还没有对话。底部输入框会调用已安装的 Claude Code 或 Codex CLI，并把过程显示在这里。
-                    </div>
-                  </ThreadPrimitive.If>
-                  <div className="space-y-6">
-                    <ThreadPrimitive.Messages>
-                      {({ message }) => {
-                        const messageText = extractThreadMessageText(message.content);
-                        const showInlineLoading =
-                          isAgentRunning && message.role === "assistant" && !messageText;
-                        const isAssistant = message.role === "assistant";
+                </div>
+              )}
+            </div>
+          </section>
 
-                        return (
-                          <MessagePrimitive.Root
-                            className={cn(
-                              "px-1",
-                              isAssistant ? "text-[#383736]" : "flex justify-end text-[#5e5a55]",
-                            )}
-                          >
-                            {isAssistant ? (
-                              <>
-                                <div className="flex items-center gap-3">
-                                  <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#9b9388]">
-                                    AI
-                                  </span>
-                                  <span className="h-px flex-1 bg-[#ede7de]" />
-                                </div>
-                                <div className="mt-2.5 whitespace-pre-wrap text-[14px] leading-7">
-                                  {showInlineLoading ? (
-                                    <span className="inline-flex items-center gap-1">
-                                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#b7afa4]" />
-                                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#b7afa4] [animation-delay:120ms]" />
-                                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#b7afa4] [animation-delay:240ms]" />
-                                    </span>
-                                  ) : (
-                                    <MessagePrimitive.Parts />
-                                  )}
-                                </div>
-                              </>
-                            ) : (
-                              <div className="max-w-[78%] rounded-[18px] bg-[#f3eee7] px-4 py-3 text-[14px] leading-7 text-[#4c4944] shadow-[0_4px_12px_rgba(0,0,0,0.03)]">
-                                <MessagePrimitive.Parts />
-                              </div>
-                            )}
-                          </MessagePrimitive.Root>
-                        );
-                      }}
-                    </ThreadPrimitive.Messages>
-                  </div>
-                </ThreadPrimitive.Viewport>
-              </ThreadPrimitive.Root>
-            </section>
-          </AssistantRuntimeProvider>
+          <section
+            aria-hidden={!isFilePreviewOpen}
+            className={cn(
+              "relative hidden h-screen flex-col overflow-hidden border-l border-[#e7e3dc] bg-[#fbfaf7] transition-all duration-300 lg:flex",
+              !isFilePreviewOpen && "pointer-events-none border-l-0 opacity-0",
+            )}
+          >
+            {isFilePreviewOpen ? <RightResizeHandle onResizeStart={startRightResize} /> : null}
+            <div className="flex items-center justify-between border-b border-[#f1ece5] px-4 py-3">
+              <div className="min-w-0">
+                <p className="truncate text-[15px] font-semibold text-[#2b2a28]">
+                  {currentFile ? previewMeta.title : "文件预览"}
+                </p>
+                <p className="mt-1 truncate text-[11px] text-[#9a958d]">
+                  {currentFile?.path ?? "点击左栏文件后在这里查看内容"}
+                </p>
+              </div>
+              <HeaderToggleButton
+                icon={<X className="h-4 w-4" />}
+                label="关闭文件预览"
+                onClick={() => setIsFilePreviewOpen(false)}
+              />
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-8 md:px-8 md:py-10 lg:px-8 lg:py-8">
+              {currentFile ? (
+                <FilePreviewPanelBody
+                  file={currentFile}
+                  previewMeta={previewMeta}
+                  previewContent={previewContent}
+                  onOpenImage={() => setIsImagePreviewOpen(true)}
+                />
+              ) : (
+                <div className="flex h-full min-h-[520px] items-center justify-center rounded-[24px] border border-dashed border-[#e2ddd5] bg-white/70 px-6 text-center text-sm leading-6 text-[#8b857e]">
+                  点击左栏文件后在这里查看内容。
+                </div>
+              )}
+            </div>
+          </section>
         </main>
       </div>
 
@@ -1343,18 +1667,21 @@ function HeaderToggleButton({
   icon,
   label,
   onClick,
+  disabled = false,
 }: {
   icon: ReactNode;
   label: string;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       aria-label={label}
       title={label}
-      className="inline-flex h-9 w-9 items-center justify-center rounded-[12px] border border-[#e4ddd4] bg-[#fbfaf7] text-[#5f5a53] transition hover:bg-white hover:text-[#222221]"
+      className="inline-flex h-9 w-9 items-center justify-center rounded-[12px] border border-[#e4ddd4] bg-[#fbfaf7] text-[#5f5a53] transition hover:bg-white hover:text-[#222221] disabled:cursor-not-allowed disabled:opacity-45"
     >
       {icon}
     </button>
@@ -1395,6 +1722,61 @@ function LeftResizeHandle({ onResizeStart }: { onResizeStart: (event: ReactPoint
     >
       <span className="absolute left-1/2 top-1/2 h-20 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#d8d1c7] transition hover:bg-[#bfb6aa]" />
     </button>
+  );
+}
+
+function RightResizeHandle({ onResizeStart }: { onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>) => void }) {
+  return (
+    <button
+      type="button"
+      aria-label="调整右栏宽度"
+      onPointerDown={onResizeStart}
+      className="absolute left-0 top-0 hidden h-full w-4 -translate-x-1/2 cursor-col-resize bg-transparent lg:block"
+    >
+      <span className="absolute left-1/2 top-1/2 h-20 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#d8d1c7] transition hover:bg-[#bfb6aa]" />
+    </button>
+  );
+}
+
+function FilePreviewPanelBody({
+  file,
+  previewMeta,
+  previewContent,
+  onOpenImage,
+}: {
+  file: FileRecord;
+  previewMeta: { title: string; lead: string };
+  previewContent: string;
+  onOpenImage: () => void;
+}) {
+  return (
+    <article className="mx-auto w-full max-w-4xl text-[#2c2c2b]">
+      <h1 className="font-sans text-[34px] font-bold leading-[1.08] tracking-[-0.04em] text-[#222221] md:text-[44px]">
+        {previewMeta.title}
+      </h1>
+      {previewMeta.lead ? (
+        <p className="mt-5 max-w-2xl text-[15px] leading-7 text-[#4d4b47] md:text-[16px]">
+          {previewMeta.lead}
+        </p>
+      ) : null}
+      <div className="mt-7 flex flex-wrap items-center gap-3 text-[11px] font-medium uppercase tracking-[0.16em] text-[#9b9388]">
+        <span>{file.path}</span>
+        <span>{file.extension.toUpperCase() || "FILE"}</span>
+        {isTextPreviewFileRecord(file) ? (
+          <span>{previewContent ? previewContent.split(/\r?\n/).length : 0} Lines</span>
+        ) : null}
+        {isTextPreviewFileRecord(file) ? (
+          <span>{previewContent.trim() ? previewContent.trim().split(/\s+/).length : 0} Words</span>
+        ) : null}
+      </div>
+      <div className="mt-8 space-y-8">
+        <FilePreview
+          file={file}
+          content={previewContent}
+          onOpenImage={onOpenImage}
+        />
+      </div>
+    </article>
   );
 }
 
@@ -2489,87 +2871,6 @@ function CreateEntryDialog({
       </div>
     </div>
   );
-}
-
-function buildBreadcrumb(workspace: Workspace | null, file: FileRecord | null) {
-  if (!workspace && !file) {
-    return ["Vault", "设计项目", "预览区"];
-  }
-
-  const root = workspace?.name || "Vault";
-  if (!file) {
-    return [root, "工作区主页"];
-  }
-
-  return [root, ...file.path.split("/")];
-}
-
-function createConversation(workspaceId: string): Conversation {
-  return {
-    id: createId("conversation"),
-    workspaceId,
-    summary: "新会话",
-    updatedAt: new Date().toISOString(),
-    messages: [],
-  };
-}
-
-function createMessage(
-  role: ConversationMessage["role"],
-  content: string,
-  kind: ConversationMessage["kind"] = "info",
-): ConversationMessage {
-  return {
-    id: createId("message"),
-    role,
-    content,
-    timestamp: new Date().toISOString(),
-    kind,
-  };
-}
-
-function summarizeConversation(messages: ConversationMessage[]) {
-  const latest = messages[messages.length - 1];
-  return latest.content.slice(0, 80);
-}
-
-function extractLatestUserText(messages: readonly { role: string; content: unknown }[]) {
-  const userMessage = [...messages].reverse().find((message) => message.role === "user");
-  return userMessage ? extractThreadMessageText(userMessage.content) : "";
-}
-
-function buildConversationHistory(messages: readonly { role: string; content: unknown }[]) {
-  const latestUserIndex = [...messages]
-    .map((message, index) => ({ message, index }))
-    .reverse()
-    .find(({ message }) => message.role === "user")?.index;
-
-  return messages
-    .filter((_, index) => index !== latestUserIndex)
-    .map((message) => {
-      const role = message.role === "assistant" ? "助手" : "用户";
-      const text = extractThreadMessageText(message.content);
-      return text ? `${role}：${text}` : "";
-    })
-    .filter(Boolean);
-}
-
-function extractThreadMessageText(content: unknown): string {
-  if (!Array.isArray(content)) {
-    return typeof content === "string" ? content : "";
-  }
-
-  return content
-    .map((part) => {
-      if (typeof part !== "object" || part === null) {
-        return "";
-      }
-
-      const typedPart = part as { type?: string; text?: string };
-      return typedPart.type === "text" ? typedPart.text ?? "" : "";
-    })
-    .join("\n")
-    .trim();
 }
 
 interface ExplorerNode {

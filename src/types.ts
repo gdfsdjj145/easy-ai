@@ -21,6 +21,76 @@ export interface Conversation {
   messages: ConversationMessage[];
 }
 
+export interface TaskThread {
+  id: string;
+  workspaceId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  status: "idle" | "running" | "error";
+}
+
+export interface AgentRun {
+  id: string;
+  taskId: string;
+  agentId: "claude" | "codex" | "local";
+  prompt: string;
+  status: "running" | "done" | "error" | "cancelled";
+  startedAt: string;
+  finishedAt?: string;
+}
+
+export interface TimelineMessage {
+  id: string;
+  taskId: string;
+  runId?: string;
+  role: "user" | "assistant" | "system";
+  kind: "prompt" | "final" | "error" | "info";
+  content: string;
+  createdAt: string;
+}
+
+export interface RunEvent {
+  id: string;
+  taskId: string;
+  runId: string;
+  seq: number;
+  type: "status" | "stdout" | "stderr" | "final" | "pending_write" | "error" | "done";
+  text?: string;
+  path?: string;
+  reason?: string;
+  content?: string;
+  createdAt: string;
+}
+
+export interface TaskStoreSnapshot {
+  tasks: TaskThread[];
+  runs: AgentRun[];
+  messages: TimelineMessage[];
+  runEvents: RunEvent[];
+}
+
+export interface AgentRunEventPayload {
+  type:
+    | "run.started"
+    | "run.log"
+    | "run.final"
+    | "run.pending_write"
+    | "run.error"
+    | "run.done";
+  taskId: string;
+  runId: string;
+  agentId?: "claude" | "codex" | "local";
+  prompt?: string;
+  seq?: number;
+  level?: "status" | "stdout" | "stderr";
+  text?: string;
+  content?: string;
+  path?: string;
+  reason?: string;
+  at: number;
+}
+
 export interface FileEntry {
   path: string;
   name: string;

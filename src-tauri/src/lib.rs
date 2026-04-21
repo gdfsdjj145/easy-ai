@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -109,6 +110,24 @@ struct AgentLogEvent {
   agent_id: String,
   kind: String,
   text: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunEvent {
+  #[serde(rename = "type")]
+  event_type: String,
+  task_id: String,
+  run_id: String,
+  agent_id: Option<String>,
+  prompt: Option<String>,
+  seq: Option<u64>,
+  level: Option<String>,
+  text: Option<String>,
+  content: Option<String>,
+  path: Option<String>,
+  reason: Option<String>,
+  at: u128,
 }
 
 #[tauri::command]
@@ -278,6 +297,150 @@ async fn run_agent_chat(
   }
 
   result
+}
+
+#[tauri::command]
+async fn start_agent_run(
+  app: AppHandle,
+  agent_id: String,
+  prompt: String,
+  api_key: String,
+  run_id: String,
+  task_id: String,
+  context: ChatContextPayload,
+) -> Result<(), String> {
+  let final_prompt = build_chat_prompt(&prompt, &context);
+  let workspace_path = context.workspace_path.clone();
+  let resolved_api_key = resolve_agent_api_key(&agent_id, &api_key)?;
+
+  let app_handle = app.clone();
+  let agent_id_for_emit = agent_id.clone();
+  tauri::async_runtime::spawn(async move {
+    emit_agent_run_event(
+      &app_handle,
+      AgentRunEvent {
+        event_type: "run.started".into(),
+        task_id: task_id.clone(),
+        run_id: run_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        prompt: Some(prompt.clone()),
+        seq: Some(0),
+        level: None,
+        text: None,
+        content: None,
+        path: None,
+        reason: None,
+        at: current_timestamp_millis(),
+      },
+    );
+
+    let blocking_app = app_handle.clone();
+    let blocking_run_id = run_id.clone();
+    let blocking_task_id = task_id.clone();
+    let blocking_agent_id = agent_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || match agent_id.as_str() {
+      "claude" => run_claude_chat_streamed(
+        &blocking_app,
+        &blocking_run_id,
+        &blocking_task_id,
+        &blocking_agent_id,
+        final_prompt,
+        workspace_path.as_deref(),
+        &resolved_api_key,
+      ),
+      "codex" => run_codex_chat_streamed(
+        &blocking_app,
+        &blocking_run_id,
+        &blocking_task_id,
+        &blocking_agent_id,
+        final_prompt,
+        workspace_path.as_deref(),
+        &resolved_api_key,
+      ),
+      _ => Err("不支持的 agent。".into()),
+    })
+    .await;
+
+    match result {
+      Ok(Ok(reply)) => {
+        emit_agent_run_event(
+          &app_handle,
+          AgentRunEvent {
+            event_type: "run.final".into(),
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: Some(agent_id_for_emit.clone()),
+            prompt: None,
+            seq: None,
+            level: None,
+            text: None,
+            content: Some(reply),
+            path: None,
+            reason: None,
+            at: current_timestamp_millis(),
+          },
+        );
+      }
+      Ok(Err(error)) => {
+        emit_agent_run_event(
+          &app_handle,
+          AgentRunEvent {
+            event_type: "run.error".into(),
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: Some(agent_id_for_emit.clone()),
+            prompt: None,
+            seq: None,
+            level: None,
+            text: Some(error),
+            content: None,
+            path: None,
+            reason: None,
+            at: current_timestamp_millis(),
+          },
+        );
+      }
+      Err(error) => {
+        emit_agent_run_event(
+          &app_handle,
+          AgentRunEvent {
+            event_type: "run.error".into(),
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: Some(agent_id_for_emit.clone()),
+            prompt: None,
+            seq: None,
+            level: None,
+            text: Some(format!("后台调用 agent 失败：{error}")),
+            content: None,
+            path: None,
+            reason: None,
+            at: current_timestamp_millis(),
+          },
+        );
+      }
+    }
+
+    emit_agent_run_event(
+      &app_handle,
+      AgentRunEvent {
+        event_type: "run.done".into(),
+        task_id,
+        run_id,
+        agent_id: Some(agent_id_for_emit),
+        prompt: None,
+        seq: None,
+        level: None,
+        text: None,
+        content: None,
+        path: None,
+        reason: None,
+        at: current_timestamp_millis(),
+      },
+    );
+  });
+
+  Ok(())
 }
 
 #[tauri::command]
@@ -566,6 +729,44 @@ fn emit_agent_log(app: &AppHandle, request_id: &str, agent_id: &str, kind: &str,
   );
 }
 
+fn current_timestamp_millis() -> u128 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_millis())
+    .unwrap_or(0)
+}
+
+fn emit_agent_run_event(app: &AppHandle, event: AgentRunEvent) {
+  let _ = app.emit("agent-run-event", event);
+}
+
+fn emit_agent_run_log(
+  app: &AppHandle,
+  task_id: &str,
+  run_id: &str,
+  seq: &AtomicU64,
+  level: &str,
+  text: &str,
+) {
+  emit_agent_run_event(
+    app,
+    AgentRunEvent {
+      event_type: "run.log".into(),
+      task_id: task_id.to_string(),
+      run_id: run_id.to_string(),
+      agent_id: None,
+      prompt: None,
+      seq: Some(seq.fetch_add(1, Ordering::Relaxed) + 1),
+      level: Some(level.to_string()),
+      text: Some(text.to_string()),
+      content: None,
+      path: None,
+      reason: None,
+      at: current_timestamp_millis(),
+    },
+  );
+}
+
 fn resolve_agent_api_key(_agent_id: &str, explicit_api_key: &str) -> Result<String, String> {
   let trimmed = explicit_api_key.trim();
   if !trimmed.is_empty() {
@@ -751,6 +952,29 @@ fn run_claude_chat(
   )
 }
 
+fn run_claude_chat_streamed(
+  app: &AppHandle,
+  run_id: &str,
+  task_id: &str,
+  agent_id: &str,
+  prompt: String,
+  workspace_path: Option<&str>,
+  api_key: &str,
+) -> Result<String, String> {
+  emit_agent_log(app, run_id, agent_id, "status", "开始调用 agent");
+  run_claude_chat_with_timeout_using_base_url_streamed(
+    app,
+    run_id,
+    task_id,
+    agent_id,
+    &prompt,
+    workspace_path,
+    api_key,
+    Duration::from_secs(CHAT_AGENT_TIMEOUT_SECS),
+    DEFAULT_AGENT_BASE_URL,
+  )
+}
+
 fn run_claude_chat_no_log(
   prompt: String,
   workspace_path: Option<&str>,
@@ -868,6 +1092,66 @@ fn run_claude_chat_with_timeout_using_base_url(
   let output = run_command_with_timeout(
     app,
     request_id,
+    None,
+    agent_id,
+    command,
+    timeout,
+    "Claude Code",
+    Some(prompt.as_bytes()),
+    false,
+  )?;
+
+  if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    return Err(if stderr.is_empty() {
+      "Claude Code 调用失败。".into()
+    } else {
+      stderr
+    });
+  }
+
+  let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  if stdout.is_empty() {
+    return Err("Claude Code 没有返回内容。".into());
+  }
+
+  Ok(stdout)
+}
+
+fn run_claude_chat_with_timeout_using_base_url_streamed(
+  app: &AppHandle,
+  run_id: &str,
+  task_id: &str,
+  agent_id: &str,
+  prompt: &str,
+  workspace_path: Option<&str>,
+  api_key: &str,
+  timeout: Duration,
+  base_url: &str,
+) -> Result<String, String> {
+  let mut command = Command::new("claude");
+  command
+    .arg("-p")
+    .arg("--output-format")
+    .arg("text")
+    .arg("--tools")
+    .arg("");
+
+  if !api_key.trim().is_empty() {
+    command
+      .env("ANTHROPIC_BASE_URL", base_url)
+      .env("ANTHROPIC_API_KEY", api_key)
+      .env("ANTHROPIC_AUTH_TOKEN", api_key);
+  }
+
+  if let Some(workspace_path) = workspace_path {
+    command.arg("--add-dir").arg(workspace_path);
+  }
+
+  let output = run_command_with_timeout(
+    app,
+    run_id,
+    Some(task_id),
     agent_id,
     command,
     timeout,
@@ -909,6 +1193,29 @@ fn run_codex_chat(
     workspace_path,
     api_key,
     Duration::from_secs(CHAT_AGENT_TIMEOUT_SECS),
+  )
+}
+
+fn run_codex_chat_streamed(
+  app: &AppHandle,
+  run_id: &str,
+  task_id: &str,
+  agent_id: &str,
+  prompt: String,
+  workspace_path: Option<&str>,
+  api_key: &str,
+) -> Result<String, String> {
+  emit_agent_log(app, run_id, agent_id, "status", "开始调用 agent");
+  run_codex_chat_with_timeout_using_base_url_streamed(
+    app,
+    run_id,
+    task_id,
+    agent_id,
+    &prompt,
+    workspace_path,
+    api_key,
+    Duration::from_secs(CHAT_AGENT_TIMEOUT_SECS),
+    DEFAULT_AGENT_BASE_URL,
   )
 }
 
@@ -1077,6 +1384,85 @@ fn run_codex_chat_with_timeout_using_base_url(
   let output = run_command_with_timeout(
     app,
     request_id,
+    None,
+    agent_id,
+    command,
+    timeout,
+    "Codex CLI",
+    Some(prompt.as_bytes()),
+    true,
+  )?;
+
+  if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    return Err(if stderr.is_empty() {
+      "Codex CLI 调用失败。".into()
+    } else {
+      stderr
+    });
+  }
+
+  let reply = fs::read_to_string(&output_path)
+    .map_err(|error| format!("读取 Codex 输出失败：{error}"))?
+    .trim()
+    .to_string();
+  let _ = fs::remove_file(&output_path);
+
+  if reply.is_empty() {
+    return Err("Codex CLI 没有返回内容。".into());
+  }
+
+  Ok(reply)
+}
+
+fn run_codex_chat_with_timeout_using_base_url_streamed(
+  app: &AppHandle,
+  run_id: &str,
+  task_id: &str,
+  agent_id: &str,
+  prompt: &str,
+  workspace_path: Option<&str>,
+  api_key: &str,
+  timeout: Duration,
+  base_url: &str,
+) -> Result<String, String> {
+  let temp_name = format!(
+    "easy-ai-codex-{}.txt",
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map(|duration| duration.as_millis())
+      .unwrap_or(0)
+  );
+  let output_path = std::env::temp_dir().join(temp_name);
+
+  let mut command = codex_command();
+  command
+    .arg("exec")
+    .arg("--skip-git-repo-check")
+    .arg("--color")
+    .arg("never")
+    .arg("--model")
+    .arg(DEFAULT_CODEX_MODEL)
+    .arg("-c")
+    .arg(format!("base_url=\"{}\"", base_url))
+    .arg("-c")
+    .arg(format!("openai_base_url=\"{}\"", base_url))
+    .arg("-o")
+    .arg(&output_path)
+    .arg("-");
+
+  if !api_key.trim().is_empty() {
+    command.env("OPENAI_API_KEY", api_key);
+  }
+
+  if let Some(workspace_path) = workspace_path {
+    command.arg("-C").arg(workspace_path);
+  }
+
+  let output = run_command_with_timeout(
+    app,
+    run_id,
+    Some(task_id),
     agent_id,
     command,
     timeout,
@@ -1186,6 +1572,7 @@ fn finalize_command_output(output: std::process::Output, label: &str) -> Result<
 fn run_command_with_timeout(
   app: &AppHandle,
   request_id: &str,
+  task_id: Option<&str>,
   agent_id: &str,
   mut command: Command,
   timeout: Duration,
@@ -1211,11 +1598,15 @@ fn run_command_with_timeout(
   let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
   let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
   let last_activity = Arc::new(Mutex::new(Instant::now()));
+  let task_id = task_id.map(|value| value.to_string());
+  let seq = Arc::new(AtomicU64::new(0));
 
   let stdout_thread = child.stdout.take().map(|stdout_pipe| {
     let app = app.clone();
     let request_id = request_id.to_string();
     let agent_id = agent_id.to_string();
+    let task_id = task_id.clone();
+    let seq = Arc::clone(&seq);
     let stdout_buffer = Arc::clone(&stdout_buffer);
     let last_activity = Arc::clone(&last_activity);
 
@@ -1240,6 +1631,9 @@ fn run_command_with_timeout(
         if stream_stdout_logs {
           emit_agent_log(&app, &request_id, &agent_id, "stdout", line.trim_end());
         }
+        if let Some(task_id) = &task_id {
+          emit_agent_run_log(&app, task_id, &request_id, &seq, "stdout", line.trim_end());
+        }
       }
     })
   });
@@ -1248,6 +1642,8 @@ fn run_command_with_timeout(
     let app = app.clone();
     let request_id = request_id.to_string();
     let agent_id = agent_id.to_string();
+    let task_id = task_id.clone();
+    let seq = Arc::clone(&seq);
     let stderr_buffer = Arc::clone(&stderr_buffer);
     let last_activity = Arc::clone(&last_activity);
 
@@ -1281,6 +1677,9 @@ fn run_command_with_timeout(
           trimmed.to_string()
         };
         emit_agent_log(&app, &request_id, &agent_id, kind, &text);
+        if let Some(task_id) = &task_id {
+          emit_agent_run_log(&app, task_id, &request_id, &seq, kind, &text);
+        }
       }
     })
   });
@@ -1354,6 +1753,7 @@ pub fn run() {
       delete_workspace_path,
       search_workspace_files,
       list_installed_agents,
+      start_agent_run,
       run_agent_chat,
       install_agent,
       test_agent_connection,

@@ -7,6 +7,7 @@ const HANDLE_KEY = "easy-ai.workspace-handle";
 export interface SessionState {
   recentWorkspaces: Workspace[];
   activeWorkspaceId: string | null;
+  activeTaskId: string | null;
   conversations: Conversation[];
   activeConversationId: string | null;
   currentFilePath: string | null;
@@ -19,6 +20,7 @@ export interface SessionState {
 export const defaultSessionState: SessionState = {
   recentWorkspaces: [],
   activeWorkspaceId: null,
+  activeTaskId: null,
   conversations: [],
   activeConversationId: null,
   currentFilePath: null,
